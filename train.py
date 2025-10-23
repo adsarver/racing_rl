@@ -63,7 +63,7 @@ for gen in range(num_generations):
     total_reward_this_gen = 0.0
     
     for step in range(STEPS_PER_GENERATION):
-        env.render(mode='human')
+        # env.render(mode='human_fast')
         
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)

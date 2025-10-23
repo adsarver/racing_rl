@@ -1,7 +1,6 @@
 # model.py
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
 import numpy as np
 
 class ActorNetwork(nn.Module):
@@ -10,7 +9,7 @@ class ActorNetwork(nn.Module):
     It takes a LIDAR scan and outputs a probability distribution
     over the continuous actions (steering and speed).
     """
-    def __init__(self, num_scan_beams=1080, state_dim=2, action_dim=2):
+    def __init__(self, num_scan_beams=1080, state_dim=3, action_dim=2):
         super(ActorNetwork, self).__init__()
         
         # Input shape: (num_agents, 1, num_scan_beams)
@@ -46,7 +45,16 @@ class ActorNetwork(nn.Module):
         return int(np.prod(x.size()[1:]))
 
     def forward(self, scan_tensor, state_tensor):
-        # NN Layers
+        if scan_tensor.ndim == 4:
+            T, B = scan_tensor.shape[0:2]
+            # Flatten Time and Batch dims for Conv1D
+            scan_tensor = scan_tensor.reshape(T * B, 1, -1) 
+            state_tensor = state_tensor.reshape(T * B, -1)
+            unflatten_output = True
+        else:
+            unflatten_output = False
+            
+        # NN Layers            
         vision_features = self.conv_layers(scan_tensor)
         vision_features = vision_features.view(vision_features.size(0), -1)
         combined_features = torch.cat((vision_features, state_tensor), dim=1)
@@ -56,25 +64,26 @@ class ActorNetwork(nn.Module):
         action_mean = self.mean_head(x)
         
         # Apply Tanh to steering_mean to keep it between [-1, 1]
-        steering_mean = torch.tanh(action_mean[:, 0].unsqueeze(1)) 
+        steering_mean = torch.tanh(action_mean[..., 0].unsqueeze(1)) 
         
         # Apply Sigmoid to speed_mean to keep it between [0, 1]
-        speed_mean = torch.sigmoid(action_mean[:, 1].unsqueeze(1))
+        speed_mean = torch.sigmoid(action_mean[..., 1].unsqueeze(1))
         
         # Combine them
-        mu = torch.cat((steering_mean, speed_mean), dim=1)
+        loc = torch.cat((steering_mean, speed_mean), dim=-1)
         
         # Get the standard deviation (std)
         action_std = torch.exp(self.log_std)
         
         # 'expand' std to match the batch size
-        action_std = action_std.expand_as(mu)
+        scale = action_std.expand_as(loc)
         
-        # Create the Normal (Gaussian) distribution
-        action_dist = Normal(mu, action_std)
-        
-        return action_dist
-    
+        if unflatten_output:
+            loc = loc.view(T, B, -1)
+            scale = scale.view(T, B, -1)
+
+        return loc, scale
+
 # In model.py, add this new class:
 
 class CriticNetwork(nn.Module):
@@ -113,14 +122,14 @@ class CriticNetwork(nn.Module):
     def forward(self, scan_tensor, state_tensor):
         if scan_tensor.ndim == 4:
             T, B = scan_tensor.shape[0:2]
-            
-            scan_tensor = scan_tensor.view(T * B, 1, -1) 
-            state_tensor = state_tensor.view(T * B, -1)
-            
+            # Flatten Time and Batch dims for Conv1D
+            scan_tensor = scan_tensor.reshape(T * B, 1, -1) 
+            state_tensor = state_tensor.reshape(T * B, -1)
             unflatten_output = True
         else:
             unflatten_output = False
         
+        # NN Layers            
         vision_features = self.conv_layers(scan_tensor)
         vision_features = vision_features.view(vision_features.size(0), -1)
         

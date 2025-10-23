@@ -1,12 +1,13 @@
-# ppo_agent.py
 import numpy as np
 import torch
 import torch.optim as optim
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, ProbabilisticTensorDictSequential, ProbabilisticTensorDictModule
 from torchrl.data import TensorDictReplayBuffer, ListStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
+from torchrl.modules import ValueOperator, ProbabilisticActor
+from torch.distributions import Normal, Independent
 
 from model import ActorNetwork, CriticNetwork
 
@@ -29,18 +30,34 @@ class PPOAgent:
         self.AGENT_PENALTY = 50.0
         self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
         
-        # --- Networks ---
-        self.actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2).to(self.device)
-        self.critic = CriticNetwork(self.num_scan_beams, self.state_dim).to(self.device)
+        # --- Networks & Wrappers ---
+        actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2).to(self.device)
+        critic = CriticNetwork(self.num_scan_beams, self.state_dim).to(self.device)
+        self.actor_module = ProbabilisticActor(
+            module=TensorDictModule(
+                actor,
+                in_keys=["observation_scan", "observation_state"],
+                out_keys=["loc", "scale"]
+            ),
+            in_keys=["loc", "scale"],
+            distribution_class=lambda loc, scale: Independent(Normal(loc, scale), 1),
+            out_keys=["action"],
+            return_log_prob=True
+        )
+        self.critic_module = ValueOperator(
+            module=critic,
+            in_keys=["observation_scan", "observation_state"],
+            out_keys=["state_value"]
+        )
         
         # --- Optimizers ---
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
+        self.actor_optimizer = optim.Adam(actor.parameters(), lr=self.lr_actor)
+        self.critic_optimizer = optim.Adam(critic.parameters(), lr=self.lr_critic)
         
         # --- Loss Modules ---
         self.loss_module = ClipPPOLoss(
-            actor_network=self.actor,
-            critic_network=self.critic,
+            actor_network=self.actor_module,
+            critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
             entropy_coef=0.01,
             loss_critic_type="l2"
@@ -49,11 +66,8 @@ class PPOAgent:
         self.advantage_module = GAE(
             gamma=self.gamma, 
             lmbda=self.gae_lambda, 
-            value_network=TensorDictModule(
-                self.critic,
-                in_keys=["observation_scan", "observation_state"],
-                out_keys=["value"]
-            )
+            value_network=self.critic_module,
+            device=self.device
         )
 
         # --- Storage ---
@@ -79,18 +93,27 @@ class PPOAgent:
         Gets an action from the Actor and a value from the Critic.
         """
         with torch.no_grad():
-            # Get the action distribution
-            action_dist = self.actor(scan_tensor, state_tensor)
-            
-            # Get the state-value
-            value = self.critic(scan_tensor, state_tensor)
+            input_td = TensorDict({
+                "observation_scan": scan_tensor,
+                "observation_state": state_tensor
+            }, batch_size=scan_tensor.shape[0])
             
             if deterministic:
-                action = action_dist.mean
+                # 'mean' or 'mode' for deterministic action
+                self.actor_module.interaction_mode = "mean" 
             else:
-                action = action_dist.sample() # Sample for exploration
+                # 'random' (sample) for exploration
+                self.actor_module.interaction_mode = "random"
             
-            log_prob = action_dist.log_prob(action)
+            # Get the action distribution
+            self.actor_module(input_td)
+            
+            # Get the state-value
+            self.critic_module(input_td)
+            
+            action = input_td["action"]
+            log_prob = input_td["action_log_prob"]
+            value = input_td["state_value"]
             
         return action, log_prob, value
 
@@ -113,11 +136,12 @@ class PPOAgent:
             "observation_scan": scans,
             "observation_state": states,
             "action": action,
-            "sample_log_prob": log_prob,
-            "value": value,
+            "action_log_prob": log_prob,
+            "state_value": value,
             "next": TensorDict({
                 "observation_scan": next_scans,
                 "observation_state": next_states,
+                "state_value": torch.zeros_like(value),
                 "reward": reward_tensor,
                 "done": done_tensor,
             }, batch_size=[self.num_agents]).to(self.device)
@@ -170,23 +194,16 @@ class PPOAgent:
         # Calculate advantages (GAE)
         # how much "better" or "worse" each action was
         with torch.no_grad():
+            data = data.permute(1, 0)
             self.advantage_module(data) # This adds "advantage" and "value_target" to the data
-            
+                    
         # Train for several epochs on this same data
-        for _ in range(10): # PPO repeats training on the same data
-            
-            # Re-compute actor/critic outputs (for grad-based training)
-            dist, value = self.actor(data["observation_scan"], data["observation_state"]), self.critic(data["observation_scan"], data["observation_state"])
-            
+        for _ in range(10): # PPO repeats training on the same data            
             # Get the loss from torchrl's PPO module
-            loss_td = self.loss_module(
-                tensordict=data,
-                actor_dist=dist,
-                value=value
-            )
+            loss_td = self.loss_module(data)
             
             # Sum the actor and critic losses
-            actor_loss = loss_td["loss_actor"]
+            actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
             critic_loss = loss_td["loss_critic"]
             loss = actor_loss + critic_loss
             
