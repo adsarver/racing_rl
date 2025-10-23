@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from tensordict import TensorDict
+from tensordict.nn import TensorDictModule
 from torchrl.data import TensorDictReplayBuffer, ListStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -47,7 +48,12 @@ class PPOAgent:
         
         self.advantage_module = GAE(
             gamma=self.gamma, 
-            lmbda=self.gae_lambda
+            lmbda=self.gae_lambda, 
+            value_network=TensorDictModule(
+                self.critic,
+                in_keys=["observation_scan", "observation_state"],
+                out_keys=["value"]
+            )
         )
 
         # --- Storage ---
@@ -101,19 +107,19 @@ class PPOAgent:
         # `reward` and `done` need to be converted
         reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device).unsqueeze(-1)
         done_tensor = torch.tensor(done, dtype=torch.bool).to(self.device).unsqueeze(-1)
-        
+
         # This dict contains a *batch* of experiences (one for each agent)
         step_data = TensorDict({
             "observation_scan": scans,
             "observation_state": states,
             "action": action,
             "sample_log_prob": log_prob,
-            "reward": reward_tensor,
-            "done": done_tensor,
             "value": value,
             "next": TensorDict({
                 "observation_scan": next_scans,
-                "observation_state": next_states
+                "observation_state": next_states,
+                "reward": reward_tensor,
+                "done": done_tensor,
             }, batch_size=[self.num_agents]).to(self.device)
         }, batch_size=[self.num_agents])
         
@@ -164,18 +170,20 @@ class PPOAgent:
         # Calculate advantages (GAE)
         # how much "better" or "worse" each action was
         with torch.no_grad():
-            next_scans = data.get(("next", "observation_scan"))
-            next_states = data.get(("next", "observation_state"))
-            
-            # Pass them through the critic
-            next_value = self.critic(next_scans, next_states)
-            data.set(("next", "value"), next_value)
             self.advantage_module(data) # This adds "advantage" and "value_target" to the data
             
         # Train for several epochs on this same data
         for _ in range(10): # PPO repeats training on the same data
+            
+            # Re-compute actor/critic outputs (for grad-based training)
+            dist, value = self.actor(data["observation_scan"], data["observation_state"]), self.critic(data["observation_scan"], data["observation_state"])
+            
             # Get the loss from torchrl's PPO module
-            loss_td = self.loss_module(data)
+            loss_td = self.loss_module(
+                tensordict=data,
+                actor_dist=dist,
+                value=value
+            )
             
             # Sum the actor and critic losses
             actor_loss = loss_td["loss_actor"]

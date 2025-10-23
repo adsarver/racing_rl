@@ -111,6 +111,16 @@ class CriticNetwork(nn.Module):
         return int(np.prod(x.size()[1:]))
 
     def forward(self, scan_tensor, state_tensor):
+        if scan_tensor.ndim == 4:
+            T, B = scan_tensor.shape[0:2]
+            
+            scan_tensor = scan_tensor.view(T * B, 1, -1) 
+            state_tensor = state_tensor.view(T * B, -1)
+            
+            unflatten_output = True
+        else:
+            unflatten_output = False
+        
         vision_features = self.conv_layers(scan_tensor)
         vision_features = vision_features.view(vision_features.size(0), -1)
         
@@ -118,6 +128,9 @@ class CriticNetwork(nn.Module):
         
         x = self.fc_layers(combined_features)
         
-        # Return the single value
         value = self.value_head(x)
-        return value
+        
+        if unflatten_output:
+            return value.view(T, B, 1)
+        else:
+            return value
