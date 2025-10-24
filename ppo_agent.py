@@ -34,7 +34,6 @@ class PPOAgent:
         # --- Reward Scalars ---
         self.SPEED_REWARD_SCALAR = 0.5
         self.PROGRESS_REWARD_SCALAR = 5.0
-        self.WALL_PENALTY = 1000.0
         self.AGENT_PENALTY = 100.0
         self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
         
@@ -262,22 +261,8 @@ class PPOAgent:
             # -- Sideways Penalty --
             sideways_speed = next_obs['linear_vels_y'][i]
             reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
-
-            is_agent_collision = next_obs['collisions'][i]
             
-            # We must check the ego agent (i == 0) differently,
-            # since its 'done' flag is special.
-            if i == 0:
-                if done_from_env:
-                    if is_agent_collision:
-                        reward -= self.AGENT_PENALTY
-                    else:
-                        reward -= self.WALL_PENALTY
-                elif is_agent_collision:
-                    reward -= self.AGENT_PENALTY
-            
-            # For all other agents (i != 0)
-            elif is_agent_collision:
+            if next_obs['collisions'][i]:
                 reward -= self.AGENT_PENALTY
                 
             rewards.append(reward)

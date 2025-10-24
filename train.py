@@ -3,6 +3,7 @@ import numpy as np
 from ppo_agent import PPOAgent
 from utils import *
 import torch
+import random
 
 params_dict = {'mu': 1.0489,
                'C_Sf': 4.718,
@@ -26,17 +27,18 @@ params_dict = {'mu': 1.0489,
 
 # --- Main Training Parameters ---
 NUM_AGENTS = 25
-MAP_NAME = "YasMarina"
+MAP_NAMES = ["YasMarina", "Catalunya", "Monza", "Silverstone", "Mexico City"]
 TOTAL_TIMESTEPS = 1_000_000
 STEPS_PER_GENERATION = 1024 # How long we "play" before "coaching"
 MAX_EPISODE_TIME = 9.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
-INITIAL_POSES = generate_start_poses(MAP_NAME, NUM_AGENTS)
+INITIAL_POSES = generate_start_poses(MAP_NAMES[0], NUM_AGENTS)
+CURRENT_MAP = MAP_NAMES[0]
 
 env = gym.make(
     "f110_gym:f110-v0",
-    map=get_map_dir(MAP_NAME) + f"/{MAP_NAME}_map",
+    map=get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map",
     num_agents=NUM_AGENTS,
     num_beams=LIDAR_BEAMS,
     fov=LIDAR_FOV,
@@ -44,7 +46,7 @@ env = gym.make(
 )
 
 # --- Agent Setup ---
-agent = PPOAgent(num_agents=NUM_AGENTS, map_name=MAP_NAME)
+agent = PPOAgent(num_agents=NUM_AGENTS, map_name=CURRENT_MAP)
 
 # --- Reset Environment ---
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
@@ -55,6 +57,7 @@ print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
 best_avg_reward = -float('inf')
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
+gen_per_map = 50
 for gen in range(num_generations):
     wall_collisions = 0
     print(f"\n--- Generation {gen+1} / {num_generations} ---")
@@ -94,10 +97,11 @@ for gen in range(num_generations):
             value=value_tensor
         )
         
+        
         # Check for Episode End (Reset)
-        wall_collision = done_from_env and next_obs['collisions'][0]
-        if wall_collision or is_time_up:
-            if wall_collision: wall_collisions += 1
+        is_collision = next_obs['collisions'][0]  # Ego agent collision
+        if is_collision or is_time_up:
+            wall_collisions += 1
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
             agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2]) # Pass X, Y only
             current_physics_time = 0.0
@@ -107,7 +111,7 @@ for gen in range(num_generations):
             
     # --- END OF GENERATION ---
     reward_avg = total_reward_this_gen / STEPS_PER_GENERATION
-    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}. Wall collisions (ego): {wall_collisions}")
+    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}. Ego collisions: {wall_collisions}")
     
     agent.learn()
     
@@ -116,6 +120,21 @@ for gen in range(num_generations):
         torch.save(agent.critic_module.module.state_dict(), f"models/critic_gen_{gen+1}.pt")
         best_avg_reward = reward_avg
         print(f"New best model saved with avg reward: {best_avg_reward:.3f}")
+        
+    if (gen+1) % gen_per_map == 0:
+        CURRENT_MAP = random.choice(MAP_NAMES)
+        print(f"Changing map to {CURRENT_MAP} for next generation.")
+        # Reset environment with new map and poses
+        INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
+        env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
+        # Reset agent raceline data
+        agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = agent._load_waypoints(new_map_name)
+        agent.last_cumulative_distance = np.zeros(agent.num_agents) 
+        agent.last_wp_index = np.zeros(agent.num_agents, dtype=np.int32)
+        
+        # Reset agent trackers
+        agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
+        env.reset(poses=INITIAL_POSES)
         
 # --- END OF TRAINING ---
 env.close()

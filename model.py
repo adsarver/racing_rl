@@ -9,9 +9,11 @@ class ActorNetwork(nn.Module):
     It takes a LIDAR scan and outputs a probability distribution
     over the continuous actions (steering and speed).
     """
-    def __init__(self, num_scan_beams=1080, state_dim=3, action_dim=2, max_speed=10.0):
+    def __init__(self, num_scan_beams=1080, state_dim=3, action_dim=2, max_speed=20.0, min_speed=-5.0, max_steering=0.4189):
         super(ActorNetwork, self).__init__()
-        self.MAX_SPEED = max_speed
+        self.MIN_SPEED = min_speed
+        self.SPEED_RANGE = max_speed - min_speed
+        self.MAX_STEERING = max_steering
         
         # Input shape: (num_agents, 1, num_scan_beams)
         self.conv_layers = nn.Sequential(
@@ -65,11 +67,12 @@ class ActorNetwork(nn.Module):
         action_mean = self.mean_head(x)
         
         # Apply Tanh to steering_mean to keep it between [-1, 1]
-        steering_mean = torch.tanh(action_mean[..., 0].unsqueeze(1)) 
+        steering_tanh = torch.tanh(action_mean[..., 0].unsqueeze(-1)) 
+        steering_mean = steering_tanh * self.MAX_STEERING
         
         # Apply Sigmoid to speed_mean to keep it between [0, 1]
         speed_tanh = torch.sigmoid(action_mean[..., 1].unsqueeze(1))
-        speed_mean = speed_tanh * self.MAX_SPEED
+        speed_mean = (speed_tanh + 1.0) * 0.5 * self.SPEED_RANGE + self.MIN_SPEED
         
         # Combine them
         loc = torch.cat((steering_mean, speed_mean), dim=-1)
