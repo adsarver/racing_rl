@@ -1,10 +1,8 @@
 import gym
 import numpy as np
 from ppo_agent import PPOAgent
-from poses_init import *
+from utils import *
 import torch
-
-MAX_PHYSICS_TIME = 10.0
 
 params_dict = {'mu': 1.0489,
                'C_Sf': 4.718,
@@ -31,7 +29,7 @@ NUM_AGENTS = 25
 MAP_NAME = "YasMarina"
 TOTAL_TIMESTEPS = 1_000_000
 STEPS_PER_GENERATION = 2048 # How long we "play" before "coaching"
-MAX_EPISODE_TIME = 15.0 # Max time in seconds before an episode resets
+MAX_EPISODE_TIME = 9.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = generate_start_poses(MAP_NAME, NUM_AGENTS)
@@ -46,10 +44,11 @@ env = gym.make(
 )
 
 # --- Agent Setup ---
-agent = PPOAgent(num_agents=NUM_AGENTS)
+agent = PPOAgent(num_agents=NUM_AGENTS, map_name=MAP_NAME)
 
 # --- Reset Environment ---
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
+agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2]) # Pass X, Y only
 current_physics_time = 0.0
 
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
@@ -57,12 +56,12 @@ print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 best_avg_reward = -float('inf')
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 for gen in range(num_generations):
-    
+    wall_collisions = 0
     print(f"\n--- Generation {gen+1} / {num_generations} ---")
     total_reward_this_gen = 0.0
     
     for step in range(STEPS_PER_GENERATION):
-        # env.render(mode='human_fast')
+        env.render(mode='human_fast')
         
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
@@ -98,8 +97,9 @@ for gen in range(num_generations):
         # Check for Episode End (Reset)
         wall_collision = done_from_env and next_obs['collisions'][0]
         if wall_collision or is_time_up:
-            print(f"Episode finished. Reason: {'Wall' if wall_collision else 'Time'}. Resetting.")
+            if wall_collision: wall_collisions += 1
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
+            agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2]) # Pass X, Y only
             current_physics_time = 0.0
         else:
             # Only update obs if not done
@@ -107,7 +107,7 @@ for gen in range(num_generations):
             
     # --- END OF GENERATION ---
     reward_avg = total_reward_this_gen / STEPS_PER_GENERATION
-    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}")
+    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}. Wall collisions (ego): {wall_collisions}")
     
     agent.learn()
     

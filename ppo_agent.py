@@ -12,7 +12,7 @@ from torch.distributions import Normal, Independent
 from model import ActorNetwork, CriticNetwork
 
 class PPOAgent:
-    def __init__(self, num_agents):
+    def __init__(self, num_agents, map_name):
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,11 +23,17 @@ class PPOAgent:
         self.clip_epsilon = 0.2 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
-        self.minibatch_size = 512
+        self.minibatch_size = 4096
         self.epochs = 10
         
+        # --- Waypoints for Raceline Reward ---
+        self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
+        self.last_cumulative_distance = np.zeros(self.num_agents) 
+        self.last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
+        
         # --- Reward Scalars ---
-        self.SPEED_REWARD_SCALAR = 0.1
+        self.SPEED_REWARD_SCALAR = 0.5
+        self.PROGRESS_REWARD_SCALAR = 5.0
         self.WALL_PENALTY = 1000.0
         self.AGENT_PENALTY = 100.0
         self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
@@ -76,6 +82,22 @@ class PPOAgent:
         self.buffer = TensorDictReplayBuffer(
             storage=ListStorage(max_size=2048) # 2048 steps per generation
         )
+        
+    def _load_waypoints(self, map_name):
+        """
+        Loads waypoints from a CSV file for the given map.
+        """
+        waypoint_file = f"maps/{map_name}/{map_name}_raceline.csv"
+        waypoints = np.loadtxt(waypoint_file, delimiter=';')
+        waypoints_xy = waypoints[:, 1:3]
+        
+        # 2. Calculate Cumulative Distance (s)
+        positions = waypoints[:, 1:3]
+        distances = np.sqrt(np.sum(np.diff(positions, axis=0)**2, axis=1))
+        waypoints_s = np.insert(np.cumsum(distances), 0, 0)
+        raceline_length = waypoints_s[-1]
+
+        return waypoints_xy, waypoints_s, raceline_length
 
     def _obs_to_tensors(self, obs):
         scans = obs['scans']
@@ -151,13 +173,91 @@ class PPOAgent:
         
         # Add the whole batch to the buffer
         self.buffer.add(step_data.cpu())
+    
+    def _project_to_raceline(self, current_pos, start_idx, lookahead):
+        """
+        Projects the agent's current position onto the raceline segment defined
+        by the search window to get the most accurate, continuous s-distance.
+        
+        Returns: projected_s (float), global_wp_index (int)
+        """
+        wp_count = len(self.waypoints_xy)
+        
+        # Create a wrapped search slice for the waypoints
+        search_indices = np.arange(start_idx, start_idx + lookahead) % wp_count
+        search_waypoints = self.waypoints_xy[search_indices]
+        
+        # Find the closest waypoint (W_curr) within the lookahead window
+        distances_in_window = np.linalg.norm(search_waypoints - current_pos, axis=1)
+        closest_wp_in_window = np.argmin(distances_in_window)
+        
+        # Map the local index back to the global index (Index C)
+        closest_wp_index_global = search_indices[closest_wp_in_window]
+        
+        # Define the segment W_prev -> W_curr for projection
+        W_curr = self.waypoints_xy[closest_wp_index_global]
+        W_prev_index = (closest_wp_index_global - 1 + wp_count) % wp_count
+        W_prev = self.waypoints_xy[W_prev_index]
+        
+        # Vector V: Segment direction (W_prev -> W_curr)
+        V = W_curr - W_prev
+        V_len_sq = np.dot(V, V)
+        
+        # Vector W: Vector from W_prev to Agent's Pos
+        W = current_pos - W_prev
+        
+        # Calculate projection length (L) of W onto V. L is a scalar.
+        if V_len_sq > 1e-6:
+            L = np.dot(W, V) / V_len_sq
+        else:
+            L = 0.0
+
+        # Clamp L to ensure the projected point P' is within the segment [0, 1]
+        L_clamped = np.clip(L, 0.0, 1.0) 
+        
+        # Calculate the true continuous s-value
+        s_prev = self.waypoints_s[W_prev_index]
+        s_curr = self.waypoints_s[closest_wp_index_global]
+        
+        segment_distance = s_curr - s_prev
+        
+        # Handle the lap wrap-around condition where s_curr is near 0 and s_prev is near max_length
+        if segment_distance < 0:
+            segment_distance += self.raceline_length
+        
+        # Projected S value: s(P') = s(W_prev) + L_clamped * segment_distance
+        projected_s = s_prev + L_clamped * segment_distance
+        
+        return projected_s, closest_wp_index_global
         
     def calculate_reward(self, done_from_env, next_obs):
         rewards = []
         for i in range(self.num_agents):
-            # -- Speed Reward --
+            # -- Initialization and Speed Reward --
             current_speed = next_obs['linear_vels_x'][i]            
             reward = current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
+            
+            # -- Raceline Reward --
+            # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
+            #        Then calculate progress along raceline at waypoint, subtract from last distance_s
+            current_pos = np.array([next_obs['poses_x'][i], next_obs['poses_y'][i]])
+            start_idx = self.last_wp_index[i]
+            
+            # Define a search window: from the last achieved WP to the next 50.
+            # This prevents the car from constantly locking onto the same, passed point.
+            lookahead = 50 # 50 is a middle-ground
+            
+            current_s, global_wp_index = self._project_to_raceline(current_pos, start_idx, lookahead)
+            
+            # Calculate progress, handling lap wrap-around
+            progress = current_s - self.last_cumulative_distance[i]
+            if progress < -self.raceline_length / 2 and self.raceline_length > 0: 
+                progress += self.raceline_length
+
+            # Update tracker and add shaped reward
+            self.last_cumulative_distance[i] = current_s
+            self.last_wp_index[i] = global_wp_index
+            reward += progress * self.PROGRESS_REWARD_SCALAR
             
             # -- Sideways Penalty --
             sideways_speed = next_obs['linear_vels_y'][i]
@@ -182,6 +282,26 @@ class PPOAgent:
                 
             rewards.append(reward)
         return rewards, np.array(rewards).mean() # Return list and avg
+    
+    def reset_progress_trackers(self, initial_poses_xy):
+        """Resets the cumulative distance tracker for all agents after an episode reset."""
+        new_last_cumulative_distance = np.zeros(self.num_agents)
+        new_last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
+        
+        # Iterate over all starting positions
+        for i in range(self.num_agents):
+            current_pos = initial_poses_xy[i]
+            
+            # 1. Find the globally closest waypoint (no lookahead needed here)
+            distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
+            closest_wp_index = np.argmin(distances)
+
+            # 2. Set the initial cumulative distance and index
+            new_last_cumulative_distance[i] = self.waypoints_s[closest_wp_index]
+            new_last_wp_index[i] = closest_wp_index
+            
+        self.last_cumulative_distance = new_last_cumulative_distance
+        self.last_wp_index = new_last_wp_index
 
     def learn(self):
         """
