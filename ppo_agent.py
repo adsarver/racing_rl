@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule, ProbabilisticTensorDictSequential, ProbabilisticTensorDictModule
+from tensordict.nn import TensorDictModule
 from torchrl.data import TensorDictReplayBuffer, ListStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -23,11 +23,13 @@ class PPOAgent:
         self.clip_epsilon = 0.2 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
+        self.minibatch_size = 512
+        self.epochs = 10
         
         # --- Reward Scalars ---
-        self.SPEED_REWARD_SCALAR = 1.0
-        self.WALL_PENALTY = 100.0
-        self.AGENT_PENALTY = 50.0
+        self.SPEED_REWARD_SCALAR = 0.1
+        self.WALL_PENALTY = 1000.0
+        self.AGENT_PENALTY = 100.0
         self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
         
         # --- Networks & Wrappers ---
@@ -59,7 +61,7 @@ class PPOAgent:
             actor_network=self.actor_module,
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
-            entropy_coef=0.01,
+            entropy_coeff=0.01,
             loss_critic_type="l2"
         )
         
@@ -148,7 +150,7 @@ class PPOAgent:
         }, batch_size=[self.num_agents])
         
         # Add the whole batch to the buffer
-        self.buffer.add(step_data)
+        self.buffer.add(step_data.cpu())
         
     def calculate_reward(self, done_from_env, next_obs):
         rewards = []
@@ -189,30 +191,52 @@ class PPOAgent:
         
         # Get all data from the "generation"
         # .sample() with no args returns the *entire* buffer
-        data = self.buffer.sample(batch_size=len(self.buffer)).to(self.device)
+        data = self.buffer.sample(batch_size=len(self.buffer))
 
         # Calculate advantages (GAE)
         # how much "better" or "worse" each action was
         with torch.no_grad():
-            data = data.permute(1, 0)
-            self.advantage_module(data) # This adds "advantage" and "value_target" to the data
-                    
+            self.critic_module.to("cpu")
+            self.advantage_module.device = "cpu"
+            
+            self.advantage_module(data) 
+            
+            self.critic_module.to(self.device)
+            self.advantage_module.device = self.device
+        
+        data = data.flatten(0, 1)
+        total_samples = data.batch_size[0]
+        
         # Train for several epochs on this same data
-        for _ in range(10): # PPO repeats training on the same data            
-            # Get the loss from torchrl's PPO module
-            loss_td = self.loss_module(data)
+        for _ in range(self.epochs): # PPO repeats training on the same data            
+            # Shuffle data indices for this epoch
+            indices = torch.randperm(total_samples)
             
-            # Sum the actor and critic losses
-            actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
-            critic_loss = loss_td["loss_critic"]
-            loss = actor_loss + critic_loss
-            
-            # -- Backpropagation --
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            loss.backward()
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
+            # Loop over all samples in minibatches
+            for start in range(0, total_samples, self.minibatch_size):
+                end = start + self.minibatch_size
+                if end > total_samples:
+                    continue # Skip the last, incomplete minibatch
+                
+                minibatch_indices = indices[start:end]
+                
+                # Sample the minibatch from the full dataset
+                minibatch_data = data[minibatch_indices].to(self.device)
+                                
+                # Get the loss from torchrl's PPO module
+                loss_td = self.loss_module(minibatch_data) # <--- Run on the minibatch
+                
+                # Sum the actor and critic losses
+                actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
+                critic_loss = loss_td["loss_critic"]
+                loss = actor_loss + critic_loss
+                
+                # -- Backpropagation --
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                loss.backward()
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
             
         # Clear the buffer for the next "generation"
         self.buffer.empty()

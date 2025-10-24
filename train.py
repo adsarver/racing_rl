@@ -1,6 +1,7 @@
 import gym
 import numpy as np
 from ppo_agent import PPOAgent
+from poses_init import *
 import torch
 
 MAX_PHYSICS_TIME = 10.0
@@ -26,21 +27,18 @@ params_dict = {'mu': 1.0489,
                }
 
 # --- Main Training Parameters ---
-NUM_AGENTS = 2
-MAP_NAME = "vegas"
+NUM_AGENTS = 25
+MAP_NAME = "YasMarina"
 TOTAL_TIMESTEPS = 1_000_000
 STEPS_PER_GENERATION = 2048 # How long we "play" before "coaching"
 MAX_EPISODE_TIME = 15.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
-LIDAR_FOV = 4.7     # Default is 4.7 radians (approx 270 deg)
-INITIAL_POSES = np.array([
-    [0., 0., 0],  # Pose for Ego agent [x, y, theta]
-    [1., 0., 0]   # Pose for Opponent agent [x, y, theta]
-])
+LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
+INITIAL_POSES = generate_start_poses(MAP_NAME, NUM_AGENTS)
 
 env = gym.make(
     "f110_gym:f110-v0",
-    map=MAP_NAME,
+    map=get_map_dir(MAP_NAME) + f"/{MAP_NAME}_map",
     num_agents=NUM_AGENTS,
     num_beams=LIDAR_BEAMS,
     fov=LIDAR_FOV,
@@ -51,7 +49,7 @@ env = gym.make(
 agent = PPOAgent(num_agents=NUM_AGENTS)
 
 # --- Reset Environment ---
-obs, step_reward, done, info = env.reset(poses=INITIAL_POSES)
+obs, _, _, _ = env.reset(poses=INITIAL_POSES)
 current_physics_time = 0.0
 
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
@@ -71,21 +69,21 @@ for gen in range(num_generations):
         action_tensor, log_prob_tensor, value_tensor = agent.get_action_and_value(
             scan_tensors, state_tensor
         )
-        
+                
         # Convert to NumPy for the Gym environment
         action_np = action_tensor.cpu().numpy()
         
         # Step the Environment
-        next_obs, step_reward, done_from_env, info = env.step(action_np)
+        next_obs, timestep, done_from_env, info = env.step(action_np)
         
         # Calculate Reward
         rewards_list, avg_reward = agent.calculate_reward(done_from_env, next_obs)
         total_reward_this_gen += avg_reward
 
         # Handle Time Limit
-        current_physics_time += step_reward
+        current_physics_time += timestep
         is_time_up = current_physics_time >= MAX_EPISODE_TIME
-
+        
         # Store Experience
         agent.store_transition(
             obs=obs,
@@ -98,10 +96,9 @@ for gen in range(num_generations):
         )
         
         # Check for Episode End (Reset)
-        is_agent_collision = next_obs['collisions'][0]
-        is_wall_collision = done_from_env and not is_agent_collision
-        if is_wall_collision or is_time_up:
-            print(f"Episode finished. Reason: {'Wall' if done_from_env else 'Time'}. Resetting.")
+        wall_collision = done_from_env and next_obs['collisions'][0]
+        if wall_collision or is_time_up:
+            print(f"Episode finished. Reason: {'Wall' if wall_collision else 'Time'}. Resetting.")
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
             current_physics_time = 0.0
         else:
