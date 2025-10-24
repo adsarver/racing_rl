@@ -56,6 +56,7 @@ current_physics_time = 0.0
 
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
+best_avg_reward = -float('inf')
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 for gen in range(num_generations):
     
@@ -108,13 +109,17 @@ for gen in range(num_generations):
             obs = next_obs
             
     # --- END OF GENERATION ---
-    print(f"Generation {gen+1} finished. Avg reward: {total_reward_this_gen / STEPS_PER_GENERATION:.3f}")
+    reward_avg = total_reward_this_gen / STEPS_PER_GENERATION
+    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}")
     
     agent.learn()
     
-    if (gen + 1) % 10 == 0:
-        torch.save(agent.actor.state_dict(), f"actor_gen_{gen+1}.pth")
-
+    if reward_avg > best_avg_reward:
+        torch.save(agent.actor_module.module.state_dict(), f"models/actor_gen_{gen+1}.pt")
+        torch.save(agent.critic_module.module.state_dict(), f"models/critic_gen_{gen+1}.pt")
+        best_avg_reward = reward_avg
+        print(f"New best model saved with avg reward: {best_avg_reward:.3f}")
+        
 # --- END OF TRAINING ---
 env.close()
 print("Training complete.")
