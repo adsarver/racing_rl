@@ -23,7 +23,7 @@ class PPOAgent:
         self.clip_epsilon = 0.2 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
-        self.minibatch_size = 4096
+        self.minibatch_size = 8192
         self.epochs = 10
         
         # --- Waypoints for Raceline Reward ---
@@ -80,7 +80,7 @@ class PPOAgent:
 
         # --- Storage ---
         self.buffer = TensorDictReplayBuffer(
-            storage=ListStorage(max_size=2048) # 2048 steps per generation
+            storage=ListStorage(max_size=1024) # 2048 steps per generation
         )
         
     def _load_waypoints(self, map_name):
