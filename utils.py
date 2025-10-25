@@ -46,7 +46,7 @@ def generate_start_poses(map_name, num_agents):
         else:
             spacing = total_raceline_length / max(1, num_agents) # Use max for safety
 
-        target_distances = [(i * 1) % total_raceline_length for i in range(num_agents)]
+        target_distances = [(i * spacing) % total_raceline_length for i in range(num_agents)]
         target_distances.sort()
 
         # 4. Interpolate Poses at Target Distances

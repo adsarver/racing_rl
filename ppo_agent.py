@@ -20,8 +20,8 @@ class PPOAgent:
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # --- Target LRs for Scheduler ---
-        self.lr_actor = 3e-4
-        self.lr_critic = 3e-4
+        self.lr_actor = 5e-4
+        self.lr_critic = 5e-4
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
         self.clip_epsilon = 0.15 # PPO clip parameter
@@ -36,10 +36,10 @@ class PPOAgent:
         self.last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
         
         # --- Reward Scalars ---
-        self.SPEED_REWARD_SCALAR = 0.5
-        self.PROGRESS_REWARD_SCALAR = 0.5
-        self.AGENT_PENALTY = 5.0
-        self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
+        self.SPEED_REWARD_SCALAR = 1.0
+        self.PROGRESS_REWARD_SCALAR = 5.0
+        self.AGENT_PENALTY = 1000
+        self.SLIDE_PENALTY_SCALAR = 0.8 # Penalty for sliding sideways
         
         # --- Networks & Wrappers ---
         actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2).to(self.device)
@@ -62,16 +62,15 @@ class PPOAgent:
         )
         
         # --- Optimizers ---
-        self.actor_optimizer = optim.Adam(actor.parameters(), lr=self.lr_actor)
-        self.critic_optimizer = optim.Adam(critic.parameters(), lr=self.lr_critic)
+        self.actor_optimizer = optim.AdamW(actor.parameters(), lr=self.lr_actor, weight_decay=0.01)
+        self.critic_optimizer = optim.AdamW(critic.parameters(), lr=self.lr_critic, weight_decay=0.01)
         
         # --- Loss Modules ---
         self.loss_module = ClipPPOLoss(
             actor_network=self.actor_module,
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=0.02,
-            loss_critic_type="l2",
+            entropy_coeff=0.01,
             normalize_advantage=True
         )
         
@@ -169,7 +168,7 @@ class PPOAgent:
         next_scans, next_states = self._obs_to_tensors(next)
         
         # `reward` and `done` need to be converted
-        reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device).unsqueeze(-1)
+        reward_tensor = torch.from_numpy(reward).to(self.device).unsqueeze(-1)
         done_tensor = torch.tensor(done, dtype=torch.bool).to(self.device).unsqueeze(-1)
 
         # This dict contains a *batch* of experiences (one for each agent)
@@ -247,14 +246,20 @@ class PPOAgent:
         
         return projected_s, closest_wp_index_global
         
-    def calculate_reward(self, next_obs):
+    def calculate_reward(self, next_obs, step):
         rewards = []
         for i in range(self.num_agents):
-            # -- Initialization and Speed Reward --
+            collided = next_obs['collisions'][i]
+            
+            # -- Initialization and Speed/Turn Reward --
+            turn_penalty = abs(next_obs['ang_vels_z'][i])**2 
             current_speed = next_obs['linear_vels_x'][i]            
-            reward = current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
+            reward = current_speed * self.SPEED_REWARD_SCALAR * (1 - turn_penalty) # Encourages forward movement while discouraging backwards movement
             
             
+            # -- Survival Reward --
+            if not collided:
+                reward += 5.0
             
             # -- Raceline Reward --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
@@ -276,10 +281,11 @@ class PPOAgent:
             # Update tracker and add shaped reward
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
-            waypoint_weight = self.generation_counter / 10 if self.generation_counter < 20 else 1.0
+            waypoint_weight = 2.0 if 10 >= self.generation_counter else 0.5
             # print(f"Speed: {reward}")
             # print(f"Progress: {progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight}")
-            reward += progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight
+            reward += progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight # Waypoint reached incentive
+            if not collided: reward += current_s # Total progress incentive
             
             
             
@@ -288,11 +294,15 @@ class PPOAgent:
             reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
             
             
-            # -- Collision Penalty --
-            reward -= self.AGENT_PENALTY * next_obs['collisions'][i]
-                
+            # -- Collision Penalty and Stay on Track reward --
+            reward -= (self.AGENT_PENALTY * collided)
+            
+            
+            # --- Time Penalty ---
+            reward -= 0.01 * step
+            
             rewards.append(reward)
-        return rewards, np.array(rewards).mean() # Return list and avg
+        return np.array(rewards), np.array(rewards).mean() # Return list and avg
     
     def reset_progress_trackers(self, initial_poses_xy):
         """Resets the cumulative distance tracker for all agents after an episode reset."""
@@ -369,7 +379,7 @@ class PPOAgent:
                 loss.backward()
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
-                
+                                
                 for key in self.diagnostic_keys:
                     if key in loss_td.keys():
                             value = loss_td[key].detach().cpu().item()
@@ -385,16 +395,7 @@ class PPOAgent:
                 # Append NaN or None if no data was collected for this key in this gen
                 self.diagnostics_history[key].append(np.nan)
 
-
-        current_lr_actor = self.actor_optimizer.param_groups[0]['lr']
-        current_lr_critic = self.critic_optimizer.param_groups[0]['lr']
-        self.diagnostics_history.setdefault("lr_actor", []).append(current_lr_actor)
-        self.diagnostics_history.setdefault("lr_critic", []).append(current_lr_critic)
         if self.generation_counter > 0: self._plot_historical_diagnostics()
-             
-        # self.actor_scheduler.step()
-        # self.critic_scheduler.step()
-        print(f"Actor LR: {self.actor_optimizer.param_groups[0]['lr']:.6f}, Critic LR: {self.critic_optimizer.param_groups[0]['lr']:.6f}")
         
         # Clear the buffer for the next "generation"
         self.buffer.empty()

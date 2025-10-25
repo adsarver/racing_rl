@@ -26,16 +26,16 @@ params_dict = {'mu': 1.0489,
                }
 
 # --- Main Training Parameters ---
-NUM_AGENTS = 20
+NUM_AGENTS = 25
 MAP_NAMES = ["YasMarina", "Catalunya", "Monza", "Silverstone", "Mexico City"]
-TOTAL_TIMESTEPS = 2_000_000
+TOTAL_TIMESTEPS = 4_000_000
 STEPS_PER_GENERATION = 2048 # How long we "play" before "coaching"
-MAX_EPISODE_TIME = 20.0 # Max time in seconds before an episode resets
+MAX_EPISODE_TIME = 40.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = generate_start_poses(MAP_NAMES[0], NUM_AGENTS)
 CURRENT_MAP = MAP_NAMES[0]
-PATIENCE = 50  # Early stopping patience
+PATIENCE = 200  # Early stopping patience
 
 env = gym.make(
     "f110_gym:f110-v0",
@@ -93,7 +93,7 @@ for gen in range(num_generations):
         done_mat = (1 - next_obs['collisions']) * done_mat
         
         # Calculate Reward
-        rewards_list, avg_reward = agent.calculate_reward(next_obs)
+        rewards_list, avg_reward = agent.calculate_reward(next_obs, step)
         total_reward_this_gen += avg_reward
         ego_reward_this_gen += rewards_list[0]
 
@@ -126,10 +126,9 @@ for gen in range(num_generations):
     # --- END OF GENERATION ---
     reward_avg = total_reward_this_gen / STEPS_PER_GENERATION
     current_avg_ego_reward = ego_reward_this_gen / STEPS_PER_GENERATION
-    print(f"Generation {gen+1} finished. Avg Reward (All): {reward_avg:.3f}, Avg Reward (Ego): {current_avg_ego_reward:.3f}. Collision Exits: {collisions}")    
+    print(f"Generation {gen+1} finished by {'Timeout' if is_time_up else 'Step'}.\n Avg Reward (All): {reward_avg:.3f}, Avg Reward (Ego): {current_avg_ego_reward:.3f}. Collision Exits: {collisions}")    
     
     agent.learn()
-    
     if reward_avg > best_avg_reward:
         torch.save(agent.actor_module.module.state_dict(), f"models/actor_gen_{gen+1}.pt")
         torch.save(agent.critic_module.module.state_dict(), f"models/critic_gen_{gen+1}.pt")

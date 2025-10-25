@@ -41,10 +41,10 @@ class ActorNetwork(nn.Module):
         self.mean_head = nn.Linear(128, action_dim)
         
         # Head for the standard deviation (log_std) of the action distribution
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        # self.log_std = nn.Parameter(torch.zeros(action_dim))
 
         # Start with higher initial noise: scale = exp(0.5) ~ 1.65
-        # self.log_std = nn.Parameter(torch.ones(action_dim) * 0.5)
+        self.log_std = nn.Parameter(torch.ones(action_dim) * 0.5)
         
     def _get_conv_output_size(self, x):
         x = self.conv_layers(x)
