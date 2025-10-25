@@ -15,7 +15,7 @@ from torch.distributions import Normal, Independent
 from model import ActorNetwork, CriticNetwork
 
 class PPOAgent:
-    def __init__(self, num_agents, map_name, total_generations):
+    def __init__(self, num_agents, map_name, steps):
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,7 +24,7 @@ class PPOAgent:
         self.lr_critic = 3e-4
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
-        self.clip_epsilon = 0.2 # PPO clip parameter
+        self.clip_epsilon = 0.15 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
         self.minibatch_size = 8192
@@ -71,7 +71,8 @@ class PPOAgent:
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
             entropy_coeff=0.02,
-            loss_critic_type="l2"
+            loss_critic_type="l2",
+            normalize_advantage=True
         )
         
         self.advantage_module = GAE(
@@ -83,7 +84,7 @@ class PPOAgent:
 
         # --- Storage ---
         self.buffer = TensorDictReplayBuffer(
-            storage=ListStorage(max_size=1024) # 2048 steps per generation
+            storage=ListStorage(max_size=steps) # 2048 steps per generation
         )
         
         # --- Diagnostics ---
@@ -254,6 +255,7 @@ class PPOAgent:
             reward = current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
             
             
+            
             # -- Raceline Reward --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
             #        Then calculate progress along raceline at waypoint, subtract from last distance_s
@@ -274,7 +276,7 @@ class PPOAgent:
             # Update tracker and add shaped reward
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
-            waypoint_weight = self.generation_counter / 20 if self.generation_counter < 20 else 1.0
+            waypoint_weight = self.generation_counter / 10 if self.generation_counter < 20 else 1.0
             # print(f"Speed: {reward}")
             # print(f"Progress: {progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight}")
             reward += progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight
@@ -286,10 +288,8 @@ class PPOAgent:
             reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
             
             
-            
             # -- Collision Penalty --
-            if next_obs['collisions'][i]:
-                reward -= self.AGENT_PENALTY
+            reward -= self.AGENT_PENALTY * next_obs['collisions'][i]
                 
             rewards.append(reward)
         return rewards, np.array(rewards).mean() # Return list and avg

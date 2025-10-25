@@ -26,10 +26,10 @@ params_dict = {'mu': 1.0489,
                }
 
 # --- Main Training Parameters ---
-NUM_AGENTS = 25
+NUM_AGENTS = 20
 MAP_NAMES = ["YasMarina", "Catalunya", "Monza", "Silverstone", "Mexico City"]
-TOTAL_TIMESTEPS = 1_000_000
-STEPS_PER_GENERATION = 1024 # How long we "play" before "coaching"
+TOTAL_TIMESTEPS = 2_000_000
+STEPS_PER_GENERATION = 2048 # How long we "play" before "coaching"
 MAX_EPISODE_TIME = 20.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
@@ -50,8 +50,8 @@ env = gym.make(
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 agent = PPOAgent(
     num_agents=NUM_AGENTS, 
-    map_name=CURRENT_MAP, 
-    total_generations=num_generations
+    map_name=CURRENT_MAP,
+    steps=STEPS_PER_GENERATION
     )
 
 # --- Reset Environment ---
@@ -74,8 +74,6 @@ for gen in range(num_generations):
     for step in range(STEPS_PER_GENERATION):
         env.render(mode='human_fast')
         
-        done_mat = (1 - obs['collisions']) * done_mat
-        
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
         action_tensor, log_prob_tensor, value_tensor = agent.get_action_and_value(
@@ -90,6 +88,9 @@ for gen in range(num_generations):
         
         # Step the Environment
         next_obs, timestep, done_from_env, info = env.step(action_np)
+        
+        # Update Done Matrix
+        done_mat = (1 - next_obs['collisions']) * done_mat
         
         # Calculate Reward
         rewards_list, avg_reward = agent.calculate_reward(next_obs)
@@ -136,7 +137,7 @@ for gen in range(num_generations):
         print(f"New best model saved with avg reward: {best_avg_reward:.3f}")
     else:
         patience += 1
-        print("No improvement in avg reward. Patience: {patience}")
+        print(f"No improvement in avg reward. Patience: {patience}")
 
     if patience >= PATIENCE:
         print("Early stopping triggered due to no improvement.")
