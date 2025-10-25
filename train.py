@@ -30,11 +30,12 @@ NUM_AGENTS = 25
 MAP_NAMES = ["YasMarina", "Catalunya", "Monza", "Silverstone", "Mexico City"]
 TOTAL_TIMESTEPS = 1_000_000
 STEPS_PER_GENERATION = 1024 # How long we "play" before "coaching"
-MAX_EPISODE_TIME = 9.0 # Max time in seconds before an episode resets
+MAX_EPISODE_TIME = 20.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = generate_start_poses(MAP_NAMES[0], NUM_AGENTS)
 CURRENT_MAP = MAP_NAMES[0]
+PATIENCE = 50  # Early stopping patience
 
 env = gym.make(
     "f110_gym:f110-v0",
@@ -46,7 +47,12 @@ env = gym.make(
 )
 
 # --- Agent Setup ---
-agent = PPOAgent(num_agents=NUM_AGENTS, map_name=CURRENT_MAP)
+num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
+agent = PPOAgent(
+    num_agents=NUM_AGENTS, 
+    map_name=CURRENT_MAP, 
+    total_generations=num_generations
+    )
 
 # --- Reset Environment ---
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
@@ -56,31 +62,39 @@ current_physics_time = 0.0
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
 best_avg_reward = -float('inf')
-num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 gen_per_map = 50
+patience = 0
+done_mat = np.ones((NUM_AGENTS,), dtype=bool)
 for gen in range(num_generations):
-    wall_collisions = 0
+    collisions = 0
     print(f"\n--- Generation {gen+1} / {num_generations} ---")
     total_reward_this_gen = 0.0
+    ego_reward_this_gen = 0.0
     
     for step in range(STEPS_PER_GENERATION):
-        # env.render(mode='human_fast')
+        env.render(mode='human_fast')
+        
+        done_mat = (1 - obs['collisions']) * done_mat
         
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
         action_tensor, log_prob_tensor, value_tensor = agent.get_action_and_value(
             scan_tensors, state_tensor
-        )
+        )            
                 
         # Convert to NumPy for the Gym environment
         action_np = action_tensor.cpu().numpy()
+        
+        # Stop episode for agents that are collided
+        action_np = np.column_stack((done_mat, done_mat)) * action_np
         
         # Step the Environment
         next_obs, timestep, done_from_env, info = env.step(action_np)
         
         # Calculate Reward
-        rewards_list, avg_reward = agent.calculate_reward(done_from_env, next_obs)
+        rewards_list, avg_reward = agent.calculate_reward(next_obs)
         total_reward_this_gen += avg_reward
+        ego_reward_this_gen += rewards_list[0]
 
         # Handle Time Limit
         current_physics_time += timestep
@@ -93,25 +107,25 @@ for gen in range(num_generations):
             action=action_tensor,
             log_prob=log_prob_tensor,
             reward=rewards_list,
-            done=np.array([done_from_env or is_time_up] * NUM_AGENTS), # Broadcast done to all agents
+            done=np.logical_or(done_mat, is_time_up), # Broadcast done to all agents
             value=value_tensor
         )
-        
-        
+                
         # Check for Episode End (Reset)
-        is_collision = next_obs['collisions'][0]  # Ego agent collision
-        if is_collision or is_time_up:
-            wall_collisions += 1
+        if done_mat.sum() == 0 or is_time_up:
+            collisions += next_obs['collisions'].sum()
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
             agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2]) # Pass X, Y only
             current_physics_time = 0.0
+            done_mat = np.ones((NUM_AGENTS,), dtype=bool)
         else:
             # Only update obs if not done
             obs = next_obs
             
     # --- END OF GENERATION ---
     reward_avg = total_reward_this_gen / STEPS_PER_GENERATION
-    print(f"Generation {gen+1} finished. Avg reward: {reward_avg:.3f}. Ego collisions: {wall_collisions}")
+    current_avg_ego_reward = ego_reward_this_gen / STEPS_PER_GENERATION
+    print(f"Generation {gen+1} finished. Avg Reward (All): {reward_avg:.3f}, Avg Reward (Ego): {current_avg_ego_reward:.3f}. Collision Exits: {collisions}")    
     
     agent.learn()
     
@@ -120,15 +134,22 @@ for gen in range(num_generations):
         torch.save(agent.critic_module.module.state_dict(), f"models/critic_gen_{gen+1}.pt")
         best_avg_reward = reward_avg
         print(f"New best model saved with avg reward: {best_avg_reward:.3f}")
+    else:
+        patience += 1
+        print("No improvement in avg reward. Patience: {patience}")
+
+    if patience >= PATIENCE:
+        print("Early stopping triggered due to no improvement.")
+        break
         
     if (gen+1) % gen_per_map == 0:
         CURRENT_MAP = random.choice(MAP_NAMES)
         print(f"Changing map to {CURRENT_MAP} for next generation.")
         # Reset environment with new map and poses
         INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
-        env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
+        env.update_map(os.path.join(os.getcwd(), get_map_dir(CURRENT_MAP), CURRENT_MAP + "_map.yaml"), ".png")
         # Reset agent raceline data
-        agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = agent._load_waypoints(new_map_name)
+        agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = agent._load_waypoints(CURRENT_MAP)
         agent.last_cumulative_distance = np.zeros(agent.num_agents) 
         agent.last_wp_index = np.zeros(agent.num_agents, dtype=np.int32)
         

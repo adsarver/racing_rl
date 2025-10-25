@@ -1,6 +1,9 @@
+import os
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torchrl.data import TensorDictReplayBuffer, ListStorage
@@ -12,12 +15,13 @@ from torch.distributions import Normal, Independent
 from model import ActorNetwork, CriticNetwork
 
 class PPOAgent:
-    def __init__(self, num_agents, map_name):
+    def __init__(self, num_agents, map_name, total_generations):
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # --- Target LRs for Scheduler ---
         self.lr_actor = 3e-4
-        self.lr_critic = 1e-3
+        self.lr_critic = 3e-4
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
         self.clip_epsilon = 0.2 # PPO clip parameter
@@ -33,8 +37,8 @@ class PPOAgent:
         
         # --- Reward Scalars ---
         self.SPEED_REWARD_SCALAR = 0.5
-        self.PROGRESS_REWARD_SCALAR = 5.0
-        self.AGENT_PENALTY = 100.0
+        self.PROGRESS_REWARD_SCALAR = 0.5
+        self.AGENT_PENALTY = 5.0
         self.SLIDE_PENALTY_SCALAR = 0.05 # Penalty for sliding sideways
         
         # --- Networks & Wrappers ---
@@ -66,7 +70,7 @@ class PPOAgent:
             actor_network=self.actor_module,
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=0.01,
+            entropy_coeff=0.02,
             loss_critic_type="l2"
         )
         
@@ -81,6 +85,19 @@ class PPOAgent:
         self.buffer = TensorDictReplayBuffer(
             storage=ListStorage(max_size=1024) # 2048 steps per generation
         )
+        
+        # --- Diagnostics ---
+        self.plot_save_path = "plots/training_diagnostics_history.png"
+        plot_dir = os.path.dirname(self.plot_save_path)
+        if plot_dir and not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
+            
+        # Initialize storage for historical averages
+        self.diagnostic_keys = ["loss_objective", "loss_entropy", "loss_critic",
+                                "entropy", "kl_approx", "clip_fraction"]
+        self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
+        self.generation_counter = 0 # Track generation for x-axis
+
         
     def _load_waypoints(self, map_name):
         """
@@ -229,12 +246,13 @@ class PPOAgent:
         
         return projected_s, closest_wp_index_global
         
-    def calculate_reward(self, done_from_env, next_obs):
+    def calculate_reward(self, next_obs):
         rewards = []
         for i in range(self.num_agents):
             # -- Initialization and Speed Reward --
             current_speed = next_obs['linear_vels_x'][i]            
             reward = current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
+            
             
             # -- Raceline Reward --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
@@ -256,12 +274,20 @@ class PPOAgent:
             # Update tracker and add shaped reward
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
-            reward += progress * self.PROGRESS_REWARD_SCALAR
+            waypoint_weight = self.generation_counter / 20 if self.generation_counter < 20 else 1.0
+            # print(f"Speed: {reward}")
+            # print(f"Progress: {progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight}")
+            reward += progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight
+            
+            
             
             # -- Sideways Penalty --
             sideways_speed = next_obs['linear_vels_y'][i]
             reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
             
+            
+            
+            # -- Collision Penalty --
             if next_obs['collisions'][i]:
                 reward -= self.AGENT_PENALTY
                 
@@ -293,7 +319,6 @@ class PPOAgent:
         The "Coaching Session" where we train the networks.
         """
         print("Starting learning phase...")
-        
         # Get all data from the "generation"
         # .sample() with no args returns the *entire* buffer
         data = self.buffer.sample(batch_size=len(self.buffer))
@@ -311,6 +336,8 @@ class PPOAgent:
         
         data = data.flatten(0, 1)
         total_samples = data.batch_size[0]
+        
+        current_gen_diagnostics = {key: [] for key in self.diagnostic_keys}
         
         # Train for several epochs on this same data
         for _ in range(self.epochs): # PPO repeats training on the same data            
@@ -342,7 +369,84 @@ class PPOAgent:
                 loss.backward()
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
-            
+                
+                for key in self.diagnostic_keys:
+                    if key in loss_td.keys():
+                            value = loss_td[key].detach().cpu().item()
+                            current_gen_diagnostics[key].append(value)
+        
+        self.generation_counter += 1
+        for key in self.diagnostic_keys:
+            values = current_gen_diagnostics.get(key, [])
+            if values: # Check if list is not empty
+                avg_value = np.mean(values)
+                self.diagnostics_history[key].append(avg_value)
+            else:
+                # Append NaN or None if no data was collected for this key in this gen
+                self.diagnostics_history[key].append(np.nan)
+
+
+        current_lr_actor = self.actor_optimizer.param_groups[0]['lr']
+        current_lr_critic = self.critic_optimizer.param_groups[0]['lr']
+        self.diagnostics_history.setdefault("lr_actor", []).append(current_lr_actor)
+        self.diagnostics_history.setdefault("lr_critic", []).append(current_lr_critic)
+        if self.generation_counter > 0: self._plot_historical_diagnostics()
+             
+        # self.actor_scheduler.step()
+        # self.critic_scheduler.step()
+        print(f"Actor LR: {self.actor_optimizer.param_groups[0]['lr']:.6f}, Critic LR: {self.critic_optimizer.param_groups[0]['lr']:.6f}")
+        
         # Clear the buffer for the next "generation"
         self.buffer.empty()
         print("Learning complete.")
+        
+    def _plot_historical_diagnostics(self):
+        """
+        Generates and saves a plot showing the trend of average diagnostics
+        across all completed generations. Overwrites the file each time.
+        """
+        # Define keys to plot (exclude generation if it's not in history dict)
+        keys_to_plot = [k for k in self.diagnostic_keys if k != "generation" and k in self.diagnostics_history]
+        num_metrics = len(keys_to_plot)
+
+        if num_metrics == 0 or self.generation_counter == 0:
+            print("No diagnostics data to plot yet.")
+            return
+
+        fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 3 * num_metrics), sharex=True)
+        if num_metrics == 1: axes = [axes] # Ensure axes is always iterable
+
+        # X-axis: Generation number
+        x_axis = np.arange(1, self.generation_counter + 1) # Generations 1, 2, 3...
+
+        # Plot each metric's history
+        for idx, key in enumerate(keys_to_plot):
+            values = self.diagnostics_history.get(key, [])
+            ax = axes[idx] # Get the correct subplot axis
+
+            if not values: # Skip if no data for this key
+                ax.set_ylabel(key)
+                ax.grid(True)
+                continue
+
+            # Convert to numpy array, handling potential NaNs if some generations had errors
+            values_np = np.array(values)
+
+            # Plot only valid (non-NaN) points
+            valid_indices = ~np.isnan(values_np)
+            if np.any(valid_indices): # Check if there are any valid points to plot
+                 ax.plot(x_axis[valid_indices], values_np[valid_indices], marker='.', linestyle='-', label=f'Avg {key}')
+            ax.set_ylabel(key)
+            ax.legend(loc='upper right')
+            ax.grid(True)
+
+        axes[-1].set_xlabel("Generation Number")
+        fig.suptitle("Training Diagnostics History", fontsize=16)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.97]) # Adjust layout to prevent title overlap
+
+        try:
+            plt.savefig(self.plot_save_path)
+            print(f"Diagnostics history plot saved to {self.plot_save_path}")
+        except Exception as e:
+            print(f"Error saving diagnostics history plot: {e}")
+        plt.close(fig) # Close the figure to free memory

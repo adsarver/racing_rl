@@ -38,13 +38,13 @@ LIDAR_BEAMS = 1080
 LIDAR_FOV = 4.7
 
 # --- Model Paths ---
-ACTOR_WEIGHTS_PATH = "actor_best.pth"
-CRITIC_WEIGHTS_PATH = "critic_best.pth"
+ACTOR_WEIGHTS_PATH = "actor_gen_48.pt"
+CRITIC_WEIGHTS_PATH = "critic_gen_48.pt"
 
 # --- Environment Setup ---
 env = gym.make(
     "f110_gym:f110-v0",
-    map=MAP_NAME,
+    map=get_map_dir(MAP_NAME) + f"/{MAP_NAME}_map",
     num_agents=NUM_AGENTS,
     num_beams=LIDAR_BEAMS,
     fov=LIDAR_FOV,
@@ -52,7 +52,7 @@ env = gym.make(
 )
 
 # --- Agent Setup ---
-agent = PPOAgent(num_agents=NUM_AGENTS)
+agent = PPOAgent(num_agents=NUM_AGENTS, map_name=MAP_NAME)
 device = agent.device
 
 # --- Load Trained Weights ---
