@@ -1,6 +1,7 @@
 import numpy as np
 import os
 from scipy.interpolate import interp1d
+import random
 
 def get_map_dir(map_name):
     """
@@ -9,7 +10,7 @@ def get_map_dir(map_name):
     map_dir = os.path.join('maps', map_name)
     return map_dir
 
-def generate_start_poses(map_name, num_agents):
+def generate_start_poses(map_name, num_agents, theta_jitter=0.05, verbose=False):
     """
     Generates safe starting poses evenly distributed along the map's raceline,
     using the format from the f1tenth_racetracks repository.
@@ -46,8 +47,8 @@ def generate_start_poses(map_name, num_agents):
         else:
             spacing = total_raceline_length / max(1, num_agents) # Use max for safety
 
-        target_distances = [(i * spacing) % total_raceline_length for i in range(num_agents)]
-        target_distances.sort()
+        target_distances = [(i * spacing * random.uniform(0.8, 1.0)) % total_raceline_length for i in range(num_agents)]
+        random.shuffle(target_distances) # Shuffle to avoid overfitting
 
         # 4. Interpolate Poses at Target Distances
         interp_x = interp1d(cumulative_distances, waypoints[:, 1], kind='linear') # <-- x index 1
@@ -58,15 +59,16 @@ def generate_start_poses(map_name, num_agents):
         
         start_poses = []
         for i, target_s in enumerate(target_distances):
+            theta_offset = random.uniform(-theta_jitter, theta_jitter)
             x = interp_x(target_s)
             y = interp_y(target_s)
             closest_wp_index = interp_theta_indices[i]
              # Ensure index is valid
             closest_wp_index = max(0, min(closest_wp_index, len(waypoints) - 1))
             theta = waypoints[closest_wp_index, 3] # <-- theta (psi_rad) index 3
-            start_poses.append([x, y, theta])
+            start_poses.append([x, y, theta + theta_offset])
 
-        print(f"Generated {num_agents} start poses spaced along the raceline.")
+        if verbose: print(f"Generated {num_agents} start poses spaced along the raceline.")
         return np.array(start_poses)
 
     except Exception as e:

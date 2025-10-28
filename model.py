@@ -3,52 +3,96 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+class VisionEncoder(nn.Module):
+    def __init__(self, num_scan_beams=1080):
+        super(VisionEncoder, self).__init__()
+        
+        # Input shape: (batch_size, 1, num_scan_beams)
+        # Based off of TinyLidarNet from: https://arxiv.org/pdf/2410.07447
+        self.conv_layers = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=24, kernel_size=10, stride=4),
+            nn.BatchNorm1d(24, track_running_stats=False),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=24, out_channels=36, kernel_size=8, stride=4),
+            nn.BatchNorm1d(36, track_running_stats=False),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=36, out_channels=48, kernel_size=4, stride=2),
+            nn.BatchNorm1d(48, track_running_stats=False),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=48, out_channels=64, kernel_size=3, stride=1),
+            nn.BatchNorm1d(64, track_running_stats=False),
+            nn.ReLU(),            
+            nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+            nn.BatchNorm1d(64, track_running_stats=False),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        # Calculate the output size of the conv layers
+        dummy_input = torch.randn(1, 1, num_scan_beams)
+        self.output_size = self._get_conv_output_size(dummy_input)
+
+    def _get_conv_output_size(self, x):
+        x = self.conv_layers(x)
+        return int(np.prod(x.size()[1:]))
+
+    def forward(self, scan_tensor):
+        return self.conv_layers(scan_tensor)
+
 class ActorNetwork(nn.Module):
     """
     A 1D CNN-based policy network (Actor).
     It takes a LIDAR scan and outputs a probability distribution
     over the continuous actions (steering and speed).
     """
-    def __init__(self, num_scan_beams=1080, state_dim=3, action_dim=2, max_speed=20.0, min_speed=-5.0, max_steering=0.4189):
+    def __init__(
+        self, 
+        num_scan_beams=1080, 
+        state_dim=3, 
+        action_dim=2, 
+        max_speed=20.0, 
+        min_speed=-5.0, 
+        max_steering=0.4189,
+        encoder=None
+        ):
         super(ActorNetwork, self).__init__()
         self.MIN_SPEED = min_speed
         self.SPEED_RANGE = max_speed - min_speed
         self.MAX_STEERING = max_steering
         
         # Input shape: (num_agents, 1, num_scan_beams)
-        self.conv_layers = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=5, stride=2),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
-        )
-        dummy_input = torch.randn(1, 1, num_scan_beams)
-        conv_output_size = self._get_conv_output_size(dummy_input)
-        
+        self.conv_layers = encoder
+        conv_output_size = self.conv_layers.output_size
+        fc_input_size = conv_output_size + state_dim
+
         self.fc_layers = nn.Sequential(
-            nn.Linear(conv_output_size + state_dim, 256),
+            nn.Linear(fc_input_size, fc_input_size),
+            nn.BatchNorm1d(fc_input_size, track_running_stats=False),
             nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
+            nn.Linear(fc_input_size, 100),
+            nn.BatchNorm1d(100, track_running_stats=False),
+            nn.ReLU(),
+            nn.Linear(100, 50),
+            nn.BatchNorm1d(50, track_running_stats=False),
+            nn.ReLU(),
+            nn.Linear(50, 10),
+            nn.BatchNorm1d(10, track_running_stats=False),
+            nn.ReLU(),
         )
-        
-        # We need two outputs for each action: one for the mean (the 'best' guess)
-        # and one for the standard deviation (the 'confidence').
 
         # Head for the mean (mu) of the action distribution
-        self.mean_head = nn.Linear(128, action_dim)
+        self.mean_head = nn.Sequential(
+            nn.Linear(10, action_dim),
+            nn.BatchNorm1d(action_dim, track_running_stats=False),
+            nn.ReLU(),
+        )
         
-        # Head for the standard deviation (log_std) of the action distribution
-        # self.log_std = nn.Parameter(torch.zeros(action_dim))
-
-        # Start with higher initial noise: scale = exp(0.5) ~ 1.65
-        self.log_std = nn.Parameter(torch.ones(action_dim) * 0.5)
-        
-    def _get_conv_output_size(self, x):
-        x = self.conv_layers(x)
-        return int(np.prod(x.size()[1:]))
+        # log_std head
+        self.log_std_head = nn.Sequential(
+            nn.Linear(10, action_dim),
+            nn.BatchNorm1d(action_dim, track_running_stats=False),
+            nn.ReLU(),
+        )
 
     def forward(self, scan_tensor, state_tensor):
         if scan_tensor.ndim == 4:
@@ -62,29 +106,27 @@ class ActorNetwork(nn.Module):
             
         # NN Layers            
         vision_features = self.conv_layers(scan_tensor)
-        vision_features = vision_features.view(vision_features.size(0), -1)
         combined_features = torch.cat((vision_features, state_tensor), dim=1)
         x = self.fc_layers(combined_features)
         
         # Heads
-        action_mean = self.mean_head(x)
+        action_mean_raw = self.mean_head(x)
+        log_std = self.log_std_head(x)
+        log_std = torch.clamp(log_std, -20.0, 2.0)
         
-        # Apply Tanh to steering_mean to keep it between [-1, 1]
-        steering_tanh = torch.tanh(action_mean[..., 0].unsqueeze(-1)) 
-        steering_mean = steering_tanh * self.MAX_STEERING
+        # Apply Tanh to means to keep it between [-1, 1]
+        action_tanh = torch.tanh(action_mean_raw)
         
-        # Apply Sigmoid to speed_mean to keep it between [0, 1]
-        speed_tanh = torch.sigmoid(action_mean[..., 1].unsqueeze(1))
-        speed_mean = (speed_tanh + 1.0) * 0.5 * self.SPEED_RANGE + self.MIN_SPEED
+        # Get steering and speed means
+        steering_mean = action_tanh[..., 0].unsqueeze(-1) * self.MAX_STEERING
+        speed_normalized = (action_tanh[..., 1].unsqueeze(-1) + 1.0) * 0.5
+        speed_mean = speed_normalized * self.SPEED_RANGE + self.MIN_SPEED
         
         # Combine them
         loc = torch.cat((steering_mean, speed_mean), dim=-1)
         
         # Get the standard deviation (std)
-        action_std = torch.exp(self.log_std)
-        
-        # 'expand' std to match the batch size
-        scale = action_std.expand_as(loc)
+        scale = torch.exp(log_std)
         
         if unflatten_output:
             loc = loc.view(T, B, -1)
@@ -95,37 +137,33 @@ class ActorNetwork(nn.Module):
 # In model.py, add this new class:
 
 class CriticNetwork(nn.Module):
-    def __init__(self, num_scan_beams=1080, state_dim=3):
+    def __init__(self, num_scan_beams=1080, state_dim=3, encoder=None):
         super(CriticNetwork, self).__init__()
         
         # Vision Stream (LIDAR)
-        self.conv_layers = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=5, stride=2),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
-        )
+        self.conv_layers = encoder
         
-        dummy_input = torch.randn(1, 1, num_scan_beams)
-        conv_output_size = self._get_conv_output_size(dummy_input)
+        conv_output_size = self.conv_layers.output_size
+        fc_input_size = conv_output_size + state_dim
         
         # Combined Fully Connected Layers
         self.fc_layers = nn.Sequential(
-            nn.Linear(conv_output_size + state_dim, 256),
+            nn.Linear(fc_input_size, fc_input_size),
+            nn.BatchNorm1d(fc_input_size, track_running_stats=False),
             nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
+            nn.Linear(fc_input_size, 100),
+            nn.BatchNorm1d(100, track_running_stats=False),
+            nn.ReLU(),
+            nn.Linear(100, 50),
+            nn.BatchNorm1d(50, track_running_stats=False),
+            nn.ReLU(),
+            nn.Linear(50, 10),
+            nn.BatchNorm1d(10, track_running_stats=False),
+            nn.ReLU(),
+            nn.Linear(10, 1),
+            nn.BatchNorm1d(1, track_running_stats=False),
+            nn.ReLU(),
         )
-        
-        # Output Head
-        # Outputs a single value, no activation function
-        self.value_head = nn.Linear(128, 1)
-
-    def _get_conv_output_size(self, x):
-        x = self.conv_layers(x)
-        return int(np.prod(x.size()[1:]))
 
     def forward(self, scan_tensor, state_tensor):
         if scan_tensor.ndim == 4:
@@ -139,13 +177,10 @@ class CriticNetwork(nn.Module):
         
         # NN Layers            
         vision_features = self.conv_layers(scan_tensor)
-        vision_features = vision_features.view(vision_features.size(0), -1)
         
         combined_features = torch.cat((vision_features, state_tensor), dim=1)
         
-        x = self.fc_layers(combined_features)
-        
-        value = self.value_head(x)
+        value = self.fc_layers(combined_features)
         
         if unflatten_output:
             return value.view(T, B, 1)

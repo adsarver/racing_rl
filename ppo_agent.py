@@ -12,22 +12,21 @@ from torchrl.objectives.value import GAE
 from torchrl.modules import ValueOperator, ProbabilisticActor
 from torch.distributions import Normal, Independent
 
-from model import ActorNetwork, CriticNetwork
+from model import ActorNetwork, CriticNetwork, VisionEncoder
 
 class PPOAgent:
     def __init__(self, num_agents, map_name, steps):
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # --- Target LRs for Scheduler ---
-        self.lr_actor = 5e-4
+        self.lr_actor = 3e-4
         self.lr_critic = 5e-4
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
-        self.clip_epsilon = 0.15 # PPO clip parameter
+        self.clip_epsilon = 0.2 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
-        self.minibatch_size = 8192
+        self.minibatch_size = 1024
         self.epochs = 10
         
         # --- Waypoints for Raceline Reward ---
@@ -36,14 +35,15 @@ class PPOAgent:
         self.last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
         
         # --- Reward Scalars ---
-        self.SPEED_REWARD_SCALAR = 1.0
-        self.PROGRESS_REWARD_SCALAR = 5.0
-        self.AGENT_PENALTY = 1000
-        self.SLIDE_PENALTY_SCALAR = 0.8 # Penalty for sliding sideways
+        self.SPEED_REWARD_SCALAR = 1.2
+        self.PROGRESS_REWARD_SCALAR = 80.0
+        self.COLLISION_PENALTY = 100.0
+        self.SLIDE_PENALTY_SCALAR = 1.2 # Penalty for sliding sideways
         
         # --- Networks & Wrappers ---
-        actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2).to(self.device)
-        critic = CriticNetwork(self.num_scan_beams, self.state_dim).to(self.device)
+        encoder = VisionEncoder(num_scan_beams=self.num_scan_beams)
+        actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2, encoder=encoder).to(self.device)
+        critic = CriticNetwork(self.num_scan_beams, self.state_dim, encoder=encoder).to(self.device)
         self.actor_module = ProbabilisticActor(
             module=TensorDictModule(
                 actor,
@@ -70,8 +70,9 @@ class PPOAgent:
             actor_network=self.actor_module,
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=0.01,
-            normalize_advantage=True
+            entropy_coeff=0.001,
+            normalize_advantage=True,
+            critic_coeff=0.5
         )
         
         self.advantage_module = GAE(
@@ -168,7 +169,7 @@ class PPOAgent:
         next_scans, next_states = self._obs_to_tensors(next)
         
         # `reward` and `done` need to be converted
-        reward_tensor = torch.from_numpy(reward).to(self.device).unsqueeze(-1)
+        reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device).unsqueeze(-1)
         done_tensor = torch.tensor(done, dtype=torch.bool).to(self.device).unsqueeze(-1)
 
         # This dict contains a *batch* of experiences (one for each agent)
@@ -246,20 +247,26 @@ class PPOAgent:
         
         return projected_s, closest_wp_index_global
         
-    def calculate_reward(self, next_obs, step):
+    def calculate_reward(self, next_obs, step, just_crashed, done_mat):
         rewards = []
         for i in range(self.num_agents):
-            collided = next_obs['collisions'][i]
+            collided = just_crashed[i] == 1
+            zombie = not collided and done_mat[i] == 0
+            reward = 0.0
             
-            # -- Initialization and Speed/Turn Reward --
-            turn_penalty = abs(next_obs['ang_vels_z'][i])**2 
-            current_speed = next_obs['linear_vels_x'][i]            
-            reward = current_speed * self.SPEED_REWARD_SCALAR * (1 - turn_penalty) # Encourages forward movement while discouraging backwards movement
+            if zombie:
+                rewards.append(0.0)
+                continue
             
+            # -- Collision Penalty--
+            if collided: 
+                rewards.append(self.COLLISION_PENALTY * collided)
+                continue # No rewards if collided
             
-            # -- Survival Reward --
-            if not collided:
-                reward += 5.0
+            # -- Speed Reward --
+            current_speed = next_obs['linear_vels_x'][i]
+            reward += current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
+
             
             # -- Raceline Reward --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
@@ -275,31 +282,28 @@ class PPOAgent:
             
             # Calculate progress, handling lap wrap-around
             progress = current_s - self.last_cumulative_distance[i]
-            if progress < -self.raceline_length / 2 and self.raceline_length > 0: 
+            
+            if progress < -self.raceline_length / 2 and self.raceline_length > 0 and step >= 20: 
                 progress += self.raceline_length
+                print(f"Lap completed by agent {i}! Step: {step} Reward: {self.raceline_length}")
 
             # Update tracker and add shaped reward
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
-            waypoint_weight = 2.0 if 10 >= self.generation_counter else 0.5
-            # print(f"Speed: {reward}")
-            # print(f"Progress: {progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight}")
-            reward += progress * self.PROGRESS_REWARD_SCALAR * waypoint_weight # Waypoint reached incentive
-            if not collided: reward += current_s # Total progress incentive
-            
-            
-            
+            if step != 0 and progress > 0.0: 
+                reward += progress * self.PROGRESS_REWARD_SCALAR # Waypoint reached incentive
+                if i == 20 and False:
+                    print(f"Agent {i} progress: {progress * self.PROGRESS_REWARD_SCALAR:.2f}, Cumulative s: {current_s:.2f}")
+                
+                
             # -- Sideways Penalty --
             sideways_speed = next_obs['linear_vels_y'][i]
             reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
-            
-            
-            # -- Collision Penalty and Stay on Track reward --
-            reward -= (self.AGENT_PENALTY * collided)
-            
+            if next_obs['linear_vels_y'][i]:
+                print(f"Sliding detected on agent {i}!")
             
             # --- Time Penalty ---
-            reward -= 0.01 * step
+            # reward -= 0.01 * step
             
             rewards.append(reward)
         return np.array(rewards), np.array(rewards).mean() # Return list and avg
@@ -313,11 +317,11 @@ class PPOAgent:
         for i in range(self.num_agents):
             current_pos = initial_poses_xy[i]
             
-            # 1. Find the globally closest waypoint (no lookahead needed here)
+            # Find the globally closest waypoint (no lookahead needed here)
             distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
             closest_wp_index = np.argmin(distances)
 
-            # 2. Set the initial cumulative distance and index
+            # Set the initial cumulative distance and index
             new_last_cumulative_distance[i] = self.waypoints_s[closest_wp_index]
             new_last_wp_index[i] = closest_wp_index
             
@@ -332,17 +336,21 @@ class PPOAgent:
         # Get all data from the "generation"
         # .sample() with no args returns the *entire* buffer
         data = self.buffer.sample(batch_size=len(self.buffer))
-
-        # Calculate advantages (GAE)
-        # how much "better" or "worse" each action was
-        with torch.no_grad():
-            self.critic_module.to("cpu")
-            self.advantage_module.device = "cpu"
-            
-            self.advantage_module(data) 
-            
-            self.critic_module.to(self.device)
-            self.advantage_module.device = self.device
+        minibatch_size = self.minibatch_size
+        
+        if len(data) < minibatch_size:
+            minibatch_size = len(data)
+            with torch.no_grad():                
+                self.advantage_module(data.to(self.device)) 
+        else:
+            with torch.no_grad():
+                self.critic_module.to("cpu")
+                self.advantage_module.device = "cpu"
+                
+                self.advantage_module(data) 
+                
+                self.critic_module.to(self.device)
+                self.advantage_module.device = self.device
         
         data = data.flatten(0, 1)
         total_samples = data.batch_size[0]
@@ -355,8 +363,8 @@ class PPOAgent:
             indices = torch.randperm(total_samples)
             
             # Loop over all samples in minibatches
-            for start in range(0, total_samples, self.minibatch_size):
-                end = start + self.minibatch_size
+            for start in range(0, total_samples, minibatch_size):
+                end = start + minibatch_size
                 if end > total_samples:
                     continue # Skip the last, incomplete minibatch
                 
@@ -367,7 +375,7 @@ class PPOAgent:
                                 
                 # Get the loss from torchrl's PPO module
                 loss_td = self.loss_module(minibatch_data) # <--- Run on the minibatch
-                
+
                 # Sum the actor and critic losses
                 actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
                 critic_loss = loss_td["loss_critic"]
@@ -379,7 +387,7 @@ class PPOAgent:
                 loss.backward()
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
-                                
+
                 for key in self.diagnostic_keys:
                     if key in loss_td.keys():
                             value = loss_td[key].detach().cpu().item()
@@ -387,14 +395,11 @@ class PPOAgent:
         
         self.generation_counter += 1
         for key in self.diagnostic_keys:
-            values = current_gen_diagnostics.get(key, [])
+            values = current_gen_diagnostics.get(key)
             if values: # Check if list is not empty
                 avg_value = np.mean(values)
                 self.diagnostics_history[key].append(avg_value)
-            else:
-                # Append NaN or None if no data was collected for this key in this gen
-                self.diagnostics_history[key].append(np.nan)
-
+        
         if self.generation_counter > 0: self._plot_historical_diagnostics()
         
         # Clear the buffer for the next "generation"
