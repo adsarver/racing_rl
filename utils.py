@@ -2,6 +2,8 @@ import numpy as np
 import os
 from scipy.interpolate import interp1d
 import random
+import gym
+from torchrl.envs.libs.gym import GymEnv
 
 def get_map_dir(map_name):
     """
@@ -79,3 +81,23 @@ def generate_start_poses(map_name, num_agents, theta_jitter=0.05, verbose=False)
         ])
         return poses
 
+# Fixes NAN and INF values
+def check_nan(obs):
+    temp_obs = obs.copy()
+    for k, v in temp_obs.items():
+        if isinstance(v, list):
+            v = np.array(v)
+            if np.any(np.isnan(v)) or np.any(np.isinf(v)):
+                print("NAN/INF DETECTED!!\n")
+                if k == 'scans':
+                    obs[k] = np.clip(v, 0.0, 30.0).tolist()
+                else:
+                    obs[k] = np.nan_to_num(v).tolist()
+        elif isinstance(v, np.ndarray):
+            if np.any(np.isnan(v)) or np.any(np.isinf(v)):
+                print("NAN/INF DETECTED!!\n")
+                if k == 'scans':
+                    obs[k] = np.clip(v, 0.0, 30.0)
+                else:
+                    obs[k] = np.nan_to_num(v)
+    return obs

@@ -1,6 +1,7 @@
 # model.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 class VisionEncoder(nn.Module):
@@ -47,18 +48,11 @@ class ActorNetwork(nn.Module):
     """
     def __init__(
         self, 
-        num_scan_beams=1080, 
         state_dim=3, 
-        action_dim=2, 
-        max_speed=20.0, 
-        min_speed=-5.0, 
-        max_steering=0.4189,
+        action_dim=2,
         encoder=None
         ):
         super(ActorNetwork, self).__init__()
-        self.MIN_SPEED = min_speed
-        self.SPEED_RANGE = max_speed - min_speed
-        self.MAX_STEERING = max_steering
         
         # Input shape: (num_agents, 1, num_scan_beams)
         self.conv_layers = encoder
@@ -81,18 +75,10 @@ class ActorNetwork(nn.Module):
         )
 
         # Head for the mean (mu) of the action distribution
-        self.mean_head = nn.Sequential(
-            nn.Linear(10, action_dim),
-            nn.BatchNorm1d(action_dim, track_running_stats=False),
-            nn.ReLU(),
-        )
+        self.mean_head = nn.Linear(10, action_dim)
         
         # log_std head
-        self.log_std_head = nn.Sequential(
-            nn.Linear(10, action_dim),
-            nn.BatchNorm1d(action_dim, track_running_stats=False),
-            nn.ReLU(),
-        )
+        self.log_std_head = nn.Linear(10, action_dim)
 
     def forward(self, scan_tensor, state_tensor):
         if scan_tensor.ndim == 4:
@@ -110,20 +96,9 @@ class ActorNetwork(nn.Module):
         x = self.fc_layers(combined_features)
         
         # Heads
-        action_mean_raw = self.mean_head(x)
+        loc = self.mean_head(x)
         log_std = self.log_std_head(x)
-        log_std = torch.clamp(log_std, -20.0, 2.0)
-        
-        # Apply Tanh to means to keep it between [-1, 1]
-        action_tanh = torch.tanh(action_mean_raw)
-        
-        # Get steering and speed means
-        steering_mean = action_tanh[..., 0].unsqueeze(-1) * self.MAX_STEERING
-        speed_normalized = (action_tanh[..., 1].unsqueeze(-1) + 1.0) * 0.5
-        speed_mean = speed_normalized * self.SPEED_RANGE + self.MIN_SPEED
-        
-        # Combine them
-        loc = torch.cat((steering_mean, speed_mean), dim=-1)
+        log_std = F.softplus(log_std)
         
         # Get the standard deviation (std)
         scale = torch.exp(log_std)
@@ -134,10 +109,9 @@ class ActorNetwork(nn.Module):
 
         return loc, scale
 
-# In model.py, add this new class:
 
 class CriticNetwork(nn.Module):
-    def __init__(self, num_scan_beams=1080, state_dim=3, encoder=None):
+    def __init__(self, state_dim=3, encoder=None):
         super(CriticNetwork, self).__init__()
         
         # Vision Stream (LIDAR)
@@ -160,9 +134,7 @@ class CriticNetwork(nn.Module):
             nn.Linear(50, 10),
             nn.BatchNorm1d(10, track_running_stats=False),
             nn.ReLU(),
-            nn.Linear(10, 1),
-            nn.BatchNorm1d(1, track_running_stats=False),
-            nn.ReLU(),
+            nn.Linear(10, 1)
         )
 
     def forward(self, scan_tensor, state_tensor):

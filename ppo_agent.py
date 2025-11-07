@@ -1,3 +1,4 @@
+import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,40 +11,48 @@ from torchrl.data import TensorDictReplayBuffer, ListStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.modules import ValueOperator, ProbabilisticActor
-from torch.distributions import Normal, Independent
-
+from torchrl.modules.distributions import TanhNormal
 from model import ActorNetwork, CriticNetwork, VisionEncoder
 
 class PPOAgent:
-    def __init__(self, num_agents, map_name, steps):
+    def __init__(self, num_agents, map_name, steps, transfer=None):
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.lr_actor = 3e-4
-        self.lr_critic = 5e-4
+        self.lr_actor = 5e-5
+        self.lr_critic = 5e-5
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
-        self.clip_epsilon = 0.2 # PPO clip parameter
+        self.clip_epsilon = 0.1 # PPO clip parameter
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
-        self.minibatch_size = 1024
-        self.epochs = 10
+        self.minibatch_size = 2048
+        self.epochs = 5
         
         # --- Waypoints for Raceline Reward ---
         self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
         self.last_cumulative_distance = np.zeros(self.num_agents) 
         self.last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
+        self.start_s = np.zeros(self.num_agents)
+        self.current_lap_count = np.zeros(self.num_agents, dtype=int)
         
         # --- Reward Scalars ---
-        self.SPEED_REWARD_SCALAR = 1.2
-        self.PROGRESS_REWARD_SCALAR = 80.0
-        self.COLLISION_PENALTY = 100.0
-        self.SLIDE_PENALTY_SCALAR = 1.2 # Penalty for sliding sideways
+        # self.SPEEDTURN_REWARD_SCALAR = 0.48
+        self.PROGRESS_REWARD_SCALAR = 5.0 * 20
+        self.LAP_REWARD = 5.0 * 20
+        self.SPEEDTURN_PENALTY_SCALAR = -0.25 * 20
+        self.COLLISION_PENALTY = -1.25 * 20
+        self.SLIDE_PENALTY_SCALAR = -0.25 * 20
+        self.DANGEROUS_COMBO_PENALTY = 0.0 * 20
         
         # --- Networks & Wrappers ---
-        encoder = VisionEncoder(num_scan_beams=self.num_scan_beams)
-        actor = ActorNetwork(self.num_scan_beams, self.state_dim, 2, encoder=encoder).to(self.device)
-        critic = CriticNetwork(self.num_scan_beams, self.state_dim, encoder=encoder).to(self.device)
+        self.actor_encoder = self._transfer_vision(transfer[0])
+        self.critic_encoder = self._transfer_vision(transfer[1])
+
+        actor = ActorNetwork(self.state_dim, 2, encoder=self.actor_encoder).to(self.device)
+        critic = CriticNetwork(self.state_dim, encoder=self.critic_encoder).to(self.device)
+        critic = self._transfer_weights(transfer[1], critic)
+        
         self.actor_module = ProbabilisticActor(
             module=TensorDictModule(
                 actor,
@@ -51,7 +60,7 @@ class PPOAgent:
                 out_keys=["loc", "scale"]
             ),
             in_keys=["loc", "scale"],
-            distribution_class=lambda loc, scale: Independent(Normal(loc, scale), 1),
+            distribution_class=TanhNormal,
             out_keys=["action"],
             return_log_prob=True
         )
@@ -62,8 +71,8 @@ class PPOAgent:
         )
         
         # --- Optimizers ---
-        self.actor_optimizer = optim.AdamW(actor.parameters(), lr=self.lr_actor, weight_decay=0.01)
-        self.critic_optimizer = optim.AdamW(critic.parameters(), lr=self.lr_critic, weight_decay=0.01)
+        self.actor_optimizer = optim.AdamW(self.actor_module.parameters(), lr=self.lr_actor, weight_decay=0.01)
+        self.critic_optimizer = optim.AdamW(self.critic_module.parameters(), lr=self.lr_critic, weight_decay=0.01)
         
         # --- Loss Modules ---
         self.loss_module = ClipPPOLoss(
@@ -72,7 +81,10 @@ class PPOAgent:
             clip_epsilon=self.clip_epsilon,
             entropy_coeff=0.001,
             normalize_advantage=True,
-            critic_coeff=0.5
+            # critic_coeff=0.5,
+            clip_value=True,
+            separate_losses=True,
+            reduction="mean"
         )
         
         self.advantage_module = GAE(
@@ -95,11 +107,64 @@ class PPOAgent:
             
         # Initialize storage for historical averages
         self.diagnostic_keys = ["loss_objective", "loss_entropy", "loss_critic",
-                                "entropy", "kl_approx", "clip_fraction"]
+                                "entropy", "kl_approx", "clip_fraction", "reward_avg"]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0 # Track generation for x-axis
-
         
+    def _transfer_weights(self, path, network):
+
+        if path is None:
+            return network.to(self.device)
+
+        checkpoint = torch.load(path)
+        
+        prefix = "0.module."
+
+        state_dict = {}
+        for k, v in checkpoint.items():
+            if k.startswith(prefix):
+                new_key = k[len(prefix):]
+                state_dict[new_key] = v
+            else: state_dict[k] = v
+
+        if state_dict:
+            network.load_state_dict(state_dict)
+            print("Successfully loaded pre-trained weights!")
+            
+        return network.to(self.device)
+
+    def _transfer_vision(self, path):
+        new_encoder = VisionEncoder(num_scan_beams=self.num_scan_beams)
+        if path is None:
+            return new_encoder.to(self.device)
+        
+        checkpoint = torch.load(path)
+        prefix = "conv_layers."
+
+        encoder_state_dict = {}
+        for k, v in checkpoint.items():
+            if k.startswith(prefix):
+                new_key = k[len(prefix):]
+                encoder_state_dict[new_key] = v
+            elif k.startswith("0.module." + prefix):
+                new_key = k[len("0.module." + prefix):]
+                encoder_state_dict[new_key] = v
+
+        if encoder_state_dict:
+            new_encoder.load_state_dict(encoder_state_dict)
+            print("Successfully loaded pre-trained encoder weights!")
+        else:
+            print(checkpoint.keys())
+            print(f"Warning: No weights found with prefix '{prefix}'. Starting with a random encoder.")
+
+        return new_encoder.to(self.device)
+
+    def _map_range(self, value, in_min, in_max, out_min=-1, out_max=1):
+        if in_max == in_min:
+            return out_min if value <= in_min else out_max
+
+        return out_min + (float(value - in_min) / float(in_max - in_min)) * (out_max - out_min)
+
     def _load_waypoints(self, map_name):
         """
         Loads waypoints from a CSV file for the given map.
@@ -118,7 +183,7 @@ class PPOAgent:
 
     def _obs_to_tensors(self, obs):
         scans = obs['scans']
-        scan_tensors = torch.from_numpy(np.array(scans)).float().to(self.device)
+        scan_tensors = torch.from_numpy(np.array(scans, dtype=np.float64)).float().to(self.device)
         scan_tensors = scan_tensors.unsqueeze(1) 
         
         state_data = np.stack(
@@ -129,7 +194,7 @@ class PPOAgent:
         
         return scan_tensors, state_tensor
 
-    def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False):
+    def get_action_and_value(self, scan_tensor, state_tensor, params, deterministic=False):
         """
         Gets an action from the Actor and a value from the Critic.
         """
@@ -152,11 +217,21 @@ class PPOAgent:
             # Get the state-value
             self.critic_module(input_td)
             
+            # Scale values to environment's action space
+            steer_scale = (params['s_max'] - params['s_min']) / 2
+            steer_shift = (params['s_max'] + params['s_min']) / 2
+            speed_scale = (params['v_max'] - params['v_min']) / 2
+            speed_shift = (params['v_max'] + params['v_min']) / 2
+            
+            steering = steer_scale * input_td["action"][..., 0].unsqueeze(-1) + steer_shift
+            speed = speed_scale * input_td["action"][..., 1].unsqueeze(-1)  + speed_shift
+            
             action = input_td["action"]
             log_prob = input_td["action_log_prob"]
             value = input_td["state_value"]
-            
-        return action, log_prob, value
+            scaled_action = torch.cat((steering, speed), dim=-1)
+
+        return action, log_prob, value, scaled_action
 
     def store_transition(self, obs, next, action, log_prob, reward, done, value):
         """
@@ -167,6 +242,10 @@ class PPOAgent:
         # Prepare data for TensorDict
         scans, states = self._obs_to_tensors(obs)
         next_scans, next_states = self._obs_to_tensors(next)
+        
+        _, _, next_value, _ = self.get_action_and_value(
+            next_scans, next_states, params={'s_max': 0, 's_min': 0, 'v_max': 0, 'v_min': 0}
+        )
         
         # `reward` and `done` need to be converted
         reward_tensor = torch.tensor(reward, dtype=torch.float32).to(self.device).unsqueeze(-1)
@@ -182,7 +261,7 @@ class PPOAgent:
             "next": TensorDict({
                 "observation_scan": next_scans,
                 "observation_state": next_states,
-                "state_value": torch.zeros_like(value),
+                "state_value": next_value,
                 "reward": reward_tensor,
                 "done": done_tensor,
             }, batch_size=[self.num_agents]).to(self.device)
@@ -247,26 +326,31 @@ class PPOAgent:
         
         return projected_s, closest_wp_index_global
         
-    def calculate_reward(self, next_obs, step, just_crashed, done_mat):
+    def calculate_reward(self, next_obs, step, just_crashed, params):
         rewards = []
         for i in range(self.num_agents):
             collided = just_crashed[i] == 1
-            zombie = not collided and done_mat[i] == 0
             reward = 0.0
             
-            if zombie:
-                rewards.append(0.0)
-                continue
-            
             # -- Collision Penalty--
-            if collided: 
-                rewards.append(self.COLLISION_PENALTY * collided)
+            if collided:
+                rewards.append(self.COLLISION_PENALTY)
                 continue # No rewards if collided
             
-            # -- Speed Reward --
-            current_speed = next_obs['linear_vels_x'][i]
-            reward += current_speed * self.SPEED_REWARD_SCALAR # Encourages forward movement while discouraging backwards movement
-
+            # -- Speed/Turn Reward -- DISABLED FOR NOW
+            center_speed = 7.5
+            ideal_turn_speed = 5.0
+            speed_offset = center_speed - ideal_turn_speed
+            current_speed = self._map_range(next_obs['linear_vels_x'][i] + speed_offset, params['v_min'], params['v_max'])
+            current_turn = self._map_range(abs(next_obs['ang_vels_z'][i]), params['sv_min'], params['sv_max'])
+            # reward += current_speed * self.SPEEDTURN_REWARD_SCALAR
+            # reward += abs(current_turn) * self.SPEEDTURN_REWARD_SCALAR
+            
+            # -- Speed/Turn Combined Penalty --
+            # Logic: Set speed floor to 0.0 so anything 5.0 and below gives no penalty
+            #        Multiple by magnitude of turn velocity to penalize sharp turns at high speed
+            reward += max(0.0, current_speed) * abs(current_turn) * self.SPEEDTURN_PENALTY_SCALAR
+            
             
             # -- Raceline Reward --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
@@ -283,33 +367,79 @@ class PPOAgent:
             # Calculate progress, handling lap wrap-around
             progress = current_s - self.last_cumulative_distance[i]
             
-            if progress < -self.raceline_length / 2 and self.raceline_length > 0 and step >= 20: 
+            if progress < -self.raceline_length / 2:
+                # Agent crossed finish line FORWARD
                 progress += self.raceline_length
-                print(f"Lap completed by agent {i}! Step: {step} Reward: {self.raceline_length}")
-
+            elif progress > self.raceline_length / 2:
+                # Agent crossed finish line BACKWARD
+                progress -= self.raceline_length
+                
             # Update tracker and add shaped reward
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
-            if step != 0 and progress > 0.0: 
+            
+            if step != 0 and progress > 0.0:
+                # print(f"Agent {i} made progress: {progress * self.PROGRESS_REWARD_SCALAR:.2f} m at step {step}")
                 reward += progress * self.PROGRESS_REWARD_SCALAR # Waypoint reached incentive
-                if i == 20 and False:
-                    print(f"Agent {i} progress: {progress * self.PROGRESS_REWARD_SCALAR:.2f}, Cumulative s: {current_s:.2f}")
+            
+            total_distance = current_s - self.start_s[i]
+            
+            if total_distance < 0:
+                total_distance += self.raceline_length * (self.current_lap_count[i] + 1)
+            else:
+                total_distance += self.raceline_length * self.current_lap_count[i]
+            
+            new_lap_count = total_distance / self.raceline_length
                 
-                
+            if new_lap_count > self.current_lap_count[i] + 1:
+                print(new_lap_count, self.current_lap_count[i], total_distance, self.raceline_length)
+                self.current_lap_count[i] = int(new_lap_count)
+                reward += self.LAP_REWARD
+                print(f"Lap {new_lap_count} completed by agent {i}! Step: {step} Bonus: {self.LAP_REWARD}")
+            
+            
+            
             # -- Sideways Penalty --
             sideways_speed = next_obs['linear_vels_y'][i]
-            reward -= abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
-            if next_obs['linear_vels_y'][i]:
-                print(f"Sliding detected on agent {i}!")
+            reward += abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
+                
+            # -- Dangerous Steering Penalty --
+            current_speed = next_obs['linear_vels_x'][i]
+            current_steer = next_obs['ang_vels_z'][i]
+            speed_threshold = 15.0  # e.g., 5 m/s
+            steer_threshold = 2.8  # e.g., 0.8 rad/s
             
-            # --- Time Penalty ---
-            # reward -= 0.01 * step
-            
+            if abs(current_steer) > steer_threshold and current_speed > speed_threshold:
+                # The penalty scales with how *much* they are over the limit
+                print("Dangerous steering at high speed detected!")
+                speed_excess = (current_speed - speed_threshold)
+                steer_excess = (abs(current_steer) - steer_threshold)
+                
+                combo_penalty = speed_excess * steer_excess * self.DANGEROUS_COMBO_PENALTY
+                reward += combo_penalty
+
             rewards.append(reward)
+                
         return np.array(rewards), np.array(rewards).mean() # Return list and avg
     
-    def reset_progress_trackers(self, initial_poses_xy):
+    def reset_progress_trackers(self, initial_poses_xy, agent_idxs=None):
         """Resets the cumulative distance tracker for all agents after an episode reset."""
+        if agent_idxs is not None:
+            for i in agent_idxs:
+                current_pos = initial_poses_xy[i]
+                
+                # Find the globally closest waypoint (no lookahead needed here)
+                distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
+                closest_wp_index = np.argmin(distances)
+                
+                start_s_val = self.waypoints_s[closest_wp_index]
+                self.last_cumulative_distance[i] = start_s_val
+                self.last_wp_index[i] = closest_wp_index
+                
+                self.start_s[i] = start_s_val
+                self.current_lap_count[i] = 0
+            return
+        
         new_last_cumulative_distance = np.zeros(self.num_agents)
         new_last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
         
@@ -321,14 +451,20 @@ class PPOAgent:
             distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
             closest_wp_index = np.argmin(distances)
 
-            # Set the initial cumulative distance and index
-            new_last_cumulative_distance[i] = self.waypoints_s[closest_wp_index]
+            # Set the initial cumulative distance and index            
+            start_s_val = self.waypoints_s[closest_wp_index]
+            new_last_cumulative_distance[i] = start_s_val
             new_last_wp_index[i] = closest_wp_index
+            
+            self.start_s[i] = start_s_val
+            self.current_lap_count[i] = 0
             
         self.last_cumulative_distance = new_last_cumulative_distance
         self.last_wp_index = new_last_wp_index
+        self.start_s = self.start_s
+        self.current_lap_count = self.current_lap_count
 
-    def learn(self):
+    def learn(self, reward_avg):
         """
         The "Coaching Session" where we train the networks.
         """
@@ -346,9 +482,11 @@ class PPOAgent:
             with torch.no_grad():
                 self.critic_module.to("cpu")
                 self.advantage_module.device = "cpu"
+                data.to("cpu")
                 
                 self.advantage_module(data) 
                 
+                data.to(self.device)
                 self.critic_module.to(self.device)
                 self.advantage_module.device = self.device
         
@@ -356,6 +494,7 @@ class PPOAgent:
         total_samples = data.batch_size[0]
         
         current_gen_diagnostics = {key: [] for key in self.diagnostic_keys}
+        current_gen_diagnostics["reward_avg"] = [reward_avg]
         
         # Train for several epochs on this same data
         for _ in range(self.epochs): # PPO repeats training on the same data            
@@ -372,20 +511,23 @@ class PPOAgent:
                 
                 # Sample the minibatch from the full dataset
                 minibatch_data = data[minibatch_indices].to(self.device)
-                                
+                
                 # Get the loss from torchrl's PPO module
                 loss_td = self.loss_module(minibatch_data) # <--- Run on the minibatch
 
                 # Sum the actor and critic losses
                 actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
                 critic_loss = loss_td["loss_critic"]
-                loss = actor_loss + critic_loss
                 
                 # -- Backpropagation --
                 self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                loss.backward()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=2.0)
                 self.actor_optimizer.step()
+                
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic_module.parameters(), max_norm=2.0)
                 self.critic_optimizer.step()
 
                 for key in self.diagnostic_keys:
@@ -419,12 +561,18 @@ class PPOAgent:
             print("No diagnostics data to plot yet.")
             return
 
-        fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 3 * num_metrics), sharex=True)
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(num_metrics, 1, figsize=(15, 4 * num_metrics), sharex=True)
         if num_metrics == 1: axes = [axes] # Ensure axes is always iterable
+        
+        # Set global font size
+        plt.rcParams['font.size'] = 16  # Adjust as needed
 
+        # Set global line width
+        plt.rcParams['lines.linewidth'] = 3 
+        
         # X-axis: Generation number
         x_axis = np.arange(1, self.generation_counter + 1) # Generations 1, 2, 3...
-
         # Plot each metric's history
         for idx, key in enumerate(keys_to_plot):
             values = self.diagnostics_history.get(key, [])
