@@ -2,9 +2,9 @@ import time
 import gym
 import numpy as np
 from ppo_agent import PPOAgent
+from control_handler import ControlHandler
 from utils import *
 import torch
-import pyglet.app
 import random
 
 params_dict = {'mu': 1.0489,
@@ -28,17 +28,28 @@ params_dict = {'mu': 1.0489,
                }
 
 # --- Main Training Parameters ---
-NUM_AGENTS = 30
-MAP_NAMES = ["SaoPaulo", "Catalunya", "Monza", "Silverstone", "Sochi"]
+NUM_AGENTS = 15
+EASY_MAPS = ["BrandsHatch", "Monza", "Hockenheim", "Melbourne"]
+MEDIUM_MAPS = ["Oschersleben", "Sakhir", "Sepang", "SaoPaulo", "Budapest", "Catalunya", "Silverstone"]
+HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Austin", "Nuerburgring", "Spa", "YasMarina", "Sochi",]
 TOTAL_TIMESTEPS = 4_000_000
 STEPS_PER_GENERATION = 2048 # How long we "play" before "coaching"
 MAX_EPISODE_TIME = 60.0 # Max time in seconds before an episode resets
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
-CURRENT_MAP = MAP_NAMES[0]
+CURRENT_MAP = EASY_MAPS[0]
 PATIENCE = 200  # Early stopping patience
-GEN_PER_MAP = 1
+GEN_PER_MAP = 50  # Increased from 30 - reduce distribution shift from map changes
+
+def get_curriculum_map_pool(generation):
+    """Returns the appropriate map pool based on training progress."""
+    if generation < len(EASY_MAPS) * GEN_PER_MAP:
+        return EASY_MAPS  # Phase 1: Learn basics
+    elif generation < len(EASY_MAPS) * GEN_PER_MAP + len(MEDIUM_MAPS) * GEN_PER_MAP:
+        return EASY_MAPS + MEDIUM_MAPS  # Phase 2: Add complexity
+    else:
+        return EASY_MAPS + MEDIUM_MAPS + HARD_MAPS  # Phase 3: Full curriculum
 
 # -- Environment Setup ---
 env = gym.make(
@@ -56,7 +67,7 @@ agent = PPOAgent(
     num_agents=NUM_AGENTS, 
     map_name=CURRENT_MAP,
     steps=STEPS_PER_GENERATION,
-    transfer=["actor_gen_4.pt", "critic_gen_4.pt"]
+    # transfer=["actor_gen_5.pt", "critic_gen_5.pt"]
 )
 
 # --- Reset Environment ---
@@ -68,10 +79,17 @@ agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
 
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
+# Render first to create the window/renderer
 env.render(mode="human")
+
+# --- Control Handler Setup (must be after render) ---
+# Set use_gamepad=True to enable controller support (requires 'inputs' package)
+control_handler = ControlHandler(env, CURRENT_MAP, params_dict, max_demo_buffer=10000, use_gamepad=True)
+
 best_avg_reward = -float('inf')
 patience = 0
 done_mat = np.ones((NUM_AGENTS,), dtype=bool)
+
 for gen in range(num_generations):
     collisions = 0
     print(f"\n--- Generation {gen+1} / {num_generations} ---")
@@ -86,6 +104,11 @@ for gen in range(num_generations):
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
         action_tensor, log_prob_tensor, value_tensor, scaled_values = agent.get_action_and_value(
             scan_tensors, state_tensor, params_dict
+        )
+        
+        # --- Human Control Override ---
+        scaled_values, action_tensor = control_handler.override_action(
+            scaled_values, action_tensor, params_dict
         )
                 
         # Convert to NumPy for the Gym environment
@@ -109,6 +132,12 @@ for gen in range(num_generations):
         
         # Calculate Reward
         rewards_list, avg_reward = agent.calculate_reward(next_obs, step, just_crashed, params_dict)
+        
+        # --- Store Human Demonstrations ---
+        control_handler.store_demonstration(
+            scan_tensors, state_tensor, action_tensor, just_crashed
+        )
+        
         total_reward_this_gen.append(avg_reward)
         ego_reward_this_gen.append(rewards_list[0])
         
@@ -125,16 +154,18 @@ for gen in range(num_generations):
             done=just_crashed,
             value=value_tensor,
         )
-        
-        print(f"{step+1}/{STEPS_PER_GENERATION}: Max vel: {np.max(next_obs['linear_vels_x']):.1f} m/s, Max act_vel: {torch.max(scaled_values[:,1]).item():.1f} m/s, Avg Reward: {sum(total_reward_this_gen) / len(total_reward_this_gen):.2f}", end='\r')
-        
+
+        print(f"{step+1}/{STEPS_PER_GENERATION}: Max vel: {np.max(next_obs['linear_vels_x']):.1f} m/s, Max actor_vel: {torch.max(scaled_values[:,1]).item():.1f} m/s, Ego Speed: {next_obs['linear_vels_x'][0]:.2f} Avg Reward: {sum(total_reward_this_gen) / len(total_reward_this_gen):.2f}", end='\r')
+
         # Check for Episode End (Reset)
         if just_crashed.any():
             collisions += just_crashed.sum()
             just_crashed_idxs = np.where(just_crashed)[0]
             done_mat[just_crashed_idxs] = 1
             
-            INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
+            poses = np.array([[x, y, theta] for x, y, theta in zip(next_obs['poses_x'], next_obs['poses_y'], next_obs['poses_theta'])])
+            
+            INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS, agent_poses=poses)
             next_obs, _, _, _ = env.reset(poses=INITIAL_POSES, agent_idxs=just_crashed_idxs)
             agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2], agent_idxs=just_crashed_idxs)
             
@@ -144,24 +175,24 @@ for gen in range(num_generations):
     print() # Finish the carriage return line
     current_physics_time = 0.0
     
-    # Reset all agents at end of generation
-    INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
-    next_obs, _, _, _ = env.reset(poses=INITIAL_POSES)
-    agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
-    done_mat = np.ones((NUM_AGENTS,), dtype=bool)
-    
-    
     # --- END OF GENERATION ---
     reward_avg = sum(total_reward_this_gen) / len(total_reward_this_gen)
     current_avg_ego_reward = sum(ego_reward_this_gen) / len(total_reward_this_gen)
     print(f"Generation {gen+1} finished.\n Avg Reward (All): {reward_avg:.3f}, Avg Reward (Ego): {current_avg_ego_reward:.3f}. Collision Exits: {collisions}")    
     
-    agent.learn(reward_avg)
+    # --- Pretrain from Demonstrations if Available ---
+    if control_handler.should_pretrain():
+        print(f"\n🎯 Using {len(control_handler.demonstration_buffer)} demonstrations for supervised learning...")
+        agent.pretrain_from_demonstrations(control_handler.demonstration_buffer, epochs=5, batch_size=64)
+        control_handler.save_demonstrations()
+        control_handler.reset_pretrain_mode()
+        print("Returning to normal RL training.\n")
+    else:
+        agent.learn(reward_avg)
+    
     if reward_avg > best_avg_reward:
         torch.save(agent.actor_module.module.state_dict(), f"models/actor/actor_gen_{gen+1}.pt")
         torch.save(agent.critic_module.module.state_dict(), f"models/critic/critic_gen_{gen+1}.pt")
-        torch.save(agent.actor_encoder.state_dict(), f"models/actor_encoder/actor_encoder_gen_{gen+1}.pt")
-        torch.save(agent.critic_encoder.state_dict(), f"models/critic_encoder/critic_encoder_gen_{gen+1}.pt")
         best_avg_reward = reward_avg
         print(f"New best model saved with avg reward: {best_avg_reward:.3f}")
         patience = 0
@@ -174,23 +205,25 @@ for gen in range(num_generations):
     #     print("Early stopping triggered due to no improvement.")
     #     break
         
-    if (gen+1) % GEN_PER_MAP == 0:            
-        CURRENT_MAP = random.choice(MAP_NAMES)
-        print(f"Changing map to {CURRENT_MAP} for next generation.")
+    if (gen+1) % GEN_PER_MAP == 0:
+        available_maps = get_curriculum_map_pool(gen+1)
+        CURRENT_MAP = random.choice(available_maps)
+        print(f"Gen {gen+1}: Map={CURRENT_MAP}, Pool size={len(available_maps)}")
         
-        # Reset environment with new map and poses
         INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
         env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
         
-        # Reset agent raceline data
         agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = agent._load_waypoints(CURRENT_MAP)
         agent.last_cumulative_distance = np.zeros(agent.num_agents) 
         agent.last_wp_index = np.zeros(agent.num_agents, dtype=np.int32)
         
-        # Reset agent trackers
         env.reset(poses=INITIAL_POSES)
         agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
         
+        # Update control handler with new map
+        control_handler.update_map(CURRENT_MAP)
+        
 # --- END OF TRAINING ---
+control_handler.cleanup()
 env.close()
 print("Training complete.")

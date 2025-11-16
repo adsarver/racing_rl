@@ -12,19 +12,19 @@ class VisionEncoder(nn.Module):
         # Based off of TinyLidarNet from: https://arxiv.org/pdf/2410.07447
         self.conv_layers = nn.Sequential(
             nn.Conv1d(in_channels=1, out_channels=24, kernel_size=10, stride=4),
-            nn.BatchNorm1d(24, track_running_stats=False),
+            nn.GroupNorm(1, 24),
             nn.ReLU(),
             nn.Conv1d(in_channels=24, out_channels=36, kernel_size=8, stride=4),
-            nn.BatchNorm1d(36, track_running_stats=False),
+            nn.GroupNorm(1, 36),
             nn.ReLU(),
             nn.Conv1d(in_channels=36, out_channels=48, kernel_size=4, stride=2),
-            nn.BatchNorm1d(48, track_running_stats=False),
+            nn.GroupNorm(1, 48),
             nn.ReLU(),
             nn.Conv1d(in_channels=48, out_channels=64, kernel_size=3, stride=1),
-            nn.BatchNorm1d(64, track_running_stats=False),
+            nn.GroupNorm(1, 64),
             nn.ReLU(),            
             nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
-            nn.BatchNorm1d(64, track_running_stats=False),
+            nn.GroupNorm(1, 64),
             nn.ReLU(),
             nn.Flatten()
         )
@@ -61,16 +61,16 @@ class ActorNetwork(nn.Module):
 
         self.fc_layers = nn.Sequential(
             nn.Linear(fc_input_size, fc_input_size),
-            nn.BatchNorm1d(fc_input_size, track_running_stats=False),
+            nn.GroupNorm(1, fc_input_size),
             nn.ReLU(),
             nn.Linear(fc_input_size, 100),
-            nn.BatchNorm1d(100, track_running_stats=False),
+            nn.GroupNorm(1, 100),
             nn.ReLU(),
             nn.Linear(100, 50),
-            nn.BatchNorm1d(50, track_running_stats=False),
+            nn.GroupNorm(1, 50),
             nn.ReLU(),
             nn.Linear(50, 10),
-            nn.BatchNorm1d(10, track_running_stats=False),
+            nn.GroupNorm(1, 10),
             nn.ReLU(),
         )
 
@@ -90,6 +90,9 @@ class ActorNetwork(nn.Module):
         else:
             unflatten_output = False
             
+        if scan_tensor.isnan().any() or state_tensor.isnan().any() or scan_tensor.isinf().any() or state_tensor.isinf().any():
+            raise ValueError("ActorNetwork forward pass received NaN inputs.")
+            
         # NN Layers            
         vision_features = self.conv_layers(scan_tensor)
         combined_features = torch.cat((vision_features, state_tensor), dim=1)
@@ -98,10 +101,14 @@ class ActorNetwork(nn.Module):
         # Heads
         loc = self.mean_head(x)
         log_std = self.log_std_head(x)
-        log_std = F.softplus(log_std)
+        log_std = torch.clamp(log_std, -20.0, 2.0)
         
         # Get the standard deviation (std)
         scale = torch.exp(log_std)
+        
+        if loc.isnan().any() or scale.isnan().any() or loc.isinf().any() or scale.isinf().any():
+            print(loc)
+            raise ValueError("ActorNetwork forward pass produced NaN or invalid values.")
         
         if unflatten_output:
             loc = loc.view(T, B, -1)
@@ -120,21 +127,25 @@ class CriticNetwork(nn.Module):
         conv_output_size = self.conv_layers.output_size
         fc_input_size = conv_output_size + state_dim
         
-        # Combined Fully Connected Layers
+        # Combined Fully Connected Layers - DEEPER & WIDER for multi-map value estimation
+        # Increased capacity to learn track-invariant value function across 18 different tracks
         self.fc_layers = nn.Sequential(
-            nn.Linear(fc_input_size, fc_input_size),
-            nn.BatchNorm1d(fc_input_size, track_running_stats=False),
+            nn.Linear(fc_input_size, 256),  # Wider first layer
+            nn.GroupNorm(1, 256),
             nn.ReLU(),
-            nn.Linear(fc_input_size, 100),
-            nn.BatchNorm1d(100, track_running_stats=False),
+            nn.Linear(256, 256),  # Additional layer
+            nn.GroupNorm(1, 256),
             nn.ReLU(),
-            nn.Linear(100, 50),
-            nn.BatchNorm1d(50, track_running_stats=False),
+            nn.Linear(256, 128),  # Gradual reduction
+            nn.GroupNorm(1, 128),
             nn.ReLU(),
-            nn.Linear(50, 10),
-            nn.BatchNorm1d(10, track_running_stats=False),
+            nn.Linear(128, 64),
+            nn.GroupNorm(1, 64),
             nn.ReLU(),
-            nn.Linear(10, 1)
+            nn.Linear(64, 32),  # Additional layer
+            nn.GroupNorm(1, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
         )
 
     def forward(self, scan_tensor, state_tensor):

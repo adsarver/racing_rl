@@ -4,7 +4,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torchrl.data import TensorDictReplayBuffer, ListStorage
@@ -19,15 +18,24 @@ class PPOAgent:
         # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.lr_actor = 5e-5
-        self.lr_critic = 5e-5
+        self.lr_actor = 5e-5  # Back to original conservative rate
+        self.lr_critic = 5e-5  # Back to original conservative rate
         self.gamma = 0.99  # Discount factor for future rewards
         self.gae_lambda = 0.95 # Lambda for GAE (Advantage calculation)
-        self.clip_epsilon = 0.1 # PPO clip parameter
+        self.clip_epsilon = 0.15 # Reduced from 0.2 - prevent excessive clipping
         self.state_dim = 3 # x_vel, y_vel, z_ang_vel
         self.num_scan_beams = 1080
         self.minibatch_size = 2048
         self.epochs = 5
+        self.epochs_with_demos = 3  # Reduce epochs when BC is active to prevent forgetting
+        
+        # --- Demonstration Retention ---
+        self.demo_buffer = None  # Store demonstrations for continual learning
+        self.demo_bc_weight = 1.0  # Initial weight for behavior cloning loss (prevents forgetting)
+        self.demo_bc_weight_initial = 1.0  # Starting BC weight after pretraining (equal to PPO)
+        self.demo_bc_weight_final = 0.3  # Final BC weight after decay
+        self.demo_bc_decay_gens = 20  # Generations to decay BC weight
+        self.demo_pretrain_generation = None  # Track when pretraining occurred
         
         # --- Waypoints for Raceline Reward ---
         self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
@@ -37,21 +45,22 @@ class PPOAgent:
         self.current_lap_count = np.zeros(self.num_agents, dtype=int)
         
         # --- Reward Scalars ---
-        # self.SPEEDTURN_REWARD_SCALAR = 0.48
-        self.PROGRESS_REWARD_SCALAR = 5.0 * 20
-        self.LAP_REWARD = 5.0 * 20
-        self.SPEEDTURN_PENALTY_SCALAR = -0.25 * 20
-        self.COLLISION_PENALTY = -1.25 * 20
-        self.SLIDE_PENALTY_SCALAR = -0.25 * 20
-        self.DANGEROUS_COMBO_PENALTY = 0.0 * 20
+        self.PROGRESS_REWARD_SCALAR = 2.0  # Main reward for following raceline
+        self.LAP_REWARD = 10.0  # Bonus for lap completion
+        self.SPEED_REWARD_SCALAR = 0.05  # Positive reward for forward speed
+        self.TURN_REWARD_SCALAR = 0.02  # Small positive reward for turning (prevents signal dropout in corners)
+        self.COLLISION_PENALTY = -3.0  # Penalty for crashing
+        self.SLIDE_PENALTY_SCALAR = -0.3  # Moderate penalty for excessive sliding
+        self.CORNER_SPEED_BONUS = 0.03  # Reward for appropriate speed in sharp turns
         
         # --- Networks & Wrappers ---
-        self.actor_encoder = self._transfer_vision(transfer[0])
-        self.critic_encoder = self._transfer_vision(transfer[1])
+        if transfer is None: transfer = [None, None]
+        shared_encoder = self._transfer_vision(transfer[0])
+        actor_encoder = shared_encoder
+        critic_encoder = shared_encoder
 
-        actor = ActorNetwork(self.state_dim, 2, encoder=self.actor_encoder).to(self.device)
-        critic = CriticNetwork(self.state_dim, encoder=self.critic_encoder).to(self.device)
-        critic = self._transfer_weights(transfer[1], critic)
+        actor = ActorNetwork(self.state_dim, 2, encoder=actor_encoder).to(self.device)
+        critic = CriticNetwork(self.state_dim, encoder=critic_encoder).to(self.device)
         
         self.actor_module = ProbabilisticActor(
             module=TensorDictModule(
@@ -79,14 +88,19 @@ class PPOAgent:
             actor_network=self.actor_module,
             critic_network=self.critic_module,
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=0.001,
+            entropy_coeff=0.35,  # Increased from 0.25 - combat entropy collapse
             normalize_advantage=True,
-            # critic_coeff=0.5,
+            critic_coeff=1.0,  # Increased from 0.5 - value network needs more weight
             clip_value=True,
             separate_losses=True,
             reduction="mean"
         )
         
+        self.loss_module.set_keys(
+            sample_log_prob="action_log_prob",
+            value="state_value",
+        )
+                
         self.advantage_module = GAE(
             gamma=self.gamma, 
             lmbda=self.gae_lambda, 
@@ -218,6 +232,7 @@ class PPOAgent:
             self.critic_module(input_td)
             
             # Scale values to environment's action space
+            # Note: Environment expects steering velocity (s_min/s_max)
             steer_scale = (params['s_max'] - params['s_min']) / 2
             steer_shift = (params['s_max'] + params['s_min']) / 2
             speed_scale = (params['v_max'] - params['v_min']) / 2
@@ -226,6 +241,14 @@ class PPOAgent:
             steering = steer_scale * input_td["action"][..., 0].unsqueeze(-1) + steer_shift
             speed = speed_scale * input_td["action"][..., 1].unsqueeze(-1)  + speed_shift
             
+            if steering.isnan().any() or speed.isnan().any() or speed.max().item() > params['v_max'] or speed.min().item() < params['v_min'] or steering.max().item() > params['s_max'] or steering.min().item() < params['s_min']:
+                raise ValueError("get_action_and_value produced NaN or invalid values.")
+            
+            if steering.max() > params['s_max'] or steering.min() < params['s_min']:
+                steering = torch.clamp(steering, max=params['s_max'], min=params['s_min'])
+            if speed.max() > params['v_max'] or speed.min() < params['v_min']:
+                speed = torch.clamp(speed, max=params['v_max'], min=params['v_min'])
+
             action = input_td["action"]
             log_prob = input_td["action_log_prob"]
             value = input_td["state_value"]
@@ -332,27 +355,25 @@ class PPOAgent:
             collided = just_crashed[i] == 1
             reward = 0.0
             
-            # -- Collision Penalty--
-            if collided:
-                rewards.append(self.COLLISION_PENALTY)
-                continue # No rewards if collided
+            # -- Forward Speed Reward (positive incentive) --
+            forward_speed = next_obs['linear_vels_x'][i]
+            normalized_speed = np.clip(forward_speed / params['v_max'], 0, 1)
+            reward += normalized_speed * self.SPEED_REWARD_SCALAR
             
-            # -- Speed/Turn Reward -- DISABLED FOR NOW
-            center_speed = 7.5
-            ideal_turn_speed = 5.0
-            speed_offset = center_speed - ideal_turn_speed
-            current_speed = self._map_range(next_obs['linear_vels_x'][i] + speed_offset, params['v_min'], params['v_max'])
-            current_turn = self._map_range(abs(next_obs['ang_vels_z'][i]), params['sv_min'], params['sv_max'])
-            # reward += current_speed * self.SPEEDTURN_REWARD_SCALAR
-            # reward += abs(current_turn) * self.SPEEDTURN_REWARD_SCALAR
+            # -- Turning Reward (prevents reward signal dropout in corners) --
+            angular_vel = abs(next_obs['ang_vels_z'][i])
+            normalized_turn = np.clip(angular_vel / params['s_max'], 0, 1)
+            reward += normalized_turn * self.TURN_REWARD_SCALAR
             
-            # -- Speed/Turn Combined Penalty --
-            # Logic: Set speed floor to 0.0 so anything 5.0 and below gives no penalty
-            #        Multiple by magnitude of turn velocity to penalize sharp turns at high speed
-            reward += max(0.0, current_speed) * abs(current_turn) * self.SPEEDTURN_PENALTY_SCALAR
+            # -- Corner Speed Management (reward appropriate speed for turn sharpness) --
+            # For sharp turns (high angular velocity), reward slower speeds
+            if normalized_turn > 0.3:  # If turning moderately to sharply
+                # Ideal speed decreases as turn sharpness increases
+                ideal_corner_speed = 1.0 - (normalized_turn * 0.5)  # Sharp turn = slower ideal speed
+                speed_appropriateness = 1.0 - abs(normalized_speed - ideal_corner_speed)
+                reward += speed_appropriateness * self.CORNER_SPEED_BONUS
             
-            
-            # -- Raceline Reward --
+            # -- Raceline Progress (main reward signal) --
             # Logic: Find closest waypoint ahead of last achieved waypoint AND within lookahead distance
             #        Then calculate progress along raceline at waypoint, subtract from last distance_s
             current_pos = np.array([next_obs['poses_x'][i], next_obs['poses_y'][i]])
@@ -378,16 +399,16 @@ class PPOAgent:
             self.last_cumulative_distance[i] = current_s
             self.last_wp_index[i] = global_wp_index
             
-            if step != 0 and progress > 0.0:
-                # print(f"Agent {i} made progress: {progress * self.PROGRESS_REWARD_SCALAR:.2f} m at step {step}")
-                reward += progress * self.PROGRESS_REWARD_SCALAR # Waypoint reached incentive
+            # if step != 0 and progress > 0.0:
+            #     print(f"Agent {i} made progress: {progress * self.PROGRESS_REWARD_SCALAR:.2f} m at step {step}")
+            #     reward += progress * self.PROGRESS_REWARD_SCALAR # Waypoint reached incentive
             
             total_distance = current_s - self.start_s[i]
             
             if total_distance < 0:
-                total_distance += self.raceline_length * (self.current_lap_count[i] + 1)
-            else:
-                total_distance += self.raceline_length * self.current_lap_count[i]
+                total_distance = 0.0
+            
+            total_distance += self.raceline_length * self.current_lap_count[i]
             
             new_lap_count = total_distance / self.raceline_length
                 
@@ -396,28 +417,27 @@ class PPOAgent:
                 self.current_lap_count[i] = int(new_lap_count)
                 reward += self.LAP_REWARD
                 print(f"Lap {new_lap_count} completed by agent {i}! Step: {step} Bonus: {self.LAP_REWARD}")
+            else:
+                reward += new_lap_count * self.PROGRESS_REWARD_SCALAR
             
             
+            # -- Collision Penalty --
+            if collided:
+                rewards.append(self.COLLISION_PENALTY)
+                continue # No rewards if collided
             
-            # -- Sideways Penalty --
-            sideways_speed = next_obs['linear_vels_y'][i]
-            reward += abs(sideways_speed) * self.SLIDE_PENALTY_SCALAR
-                
-            # -- Dangerous Steering Penalty --
-            current_speed = next_obs['linear_vels_x'][i]
-            current_steer = next_obs['ang_vels_z'][i]
-            speed_threshold = 15.0  # e.g., 5 m/s
-            steer_threshold = 2.8  # e.g., 0.8 rad/s
-            
-            if abs(current_steer) > steer_threshold and current_speed > speed_threshold:
-                # The penalty scales with how *much* they are over the limit
-                print("Dangerous steering at high speed detected!")
-                speed_excess = (current_speed - speed_threshold)
-                steer_excess = (abs(current_steer) - steer_threshold)
-                
-                combo_penalty = speed_excess * steer_excess * self.DANGEROUS_COMBO_PENALTY
-                reward += combo_penalty
+            # -- Sideways Slide Penalty --
+            sideways_speed = abs(next_obs['linear_vels_y'][i])
+            reward += sideways_speed * self.SLIDE_PENALTY_SCALAR
 
+            # -- Reward Clipping --
+            if reward <= -1000.0:
+                print(f"Large negative reward detected: {reward:.2f}")
+                reward = -1.0
+            elif reward >= 1000.0:
+                print(f"Large positive reward detected: {reward:.2f}")
+                reward = 1.0
+                
             rewards.append(reward)
                 
         return np.array(rewards), np.array(rewards).mean() # Return list and avg
@@ -461,8 +481,66 @@ class PPOAgent:
             
         self.last_cumulative_distance = new_last_cumulative_distance
         self.last_wp_index = new_last_wp_index
-        self.start_s = self.start_s
-        self.current_lap_count = self.current_lap_count
+
+    def pretrain_from_demonstrations(self, demo_buffer, epochs=10, batch_size=64):
+        """
+        Supervised learning from human demonstrations using behavior cloning.
+        Also stores demos for continual learning (prevents catastrophic forgetting).
+        """
+        if len(demo_buffer) < batch_size:
+            print(f"Not enough demos ({len(demo_buffer)} < {batch_size}). Skipping pretraining.")
+            return
+        
+        # Store demos for continual BC regularization during RL training
+        self.demo_buffer = demo_buffer
+        self.demo_pretrain_generation = self.generation_counter  # Mark when pretraining occurred
+        print(f"\nPretraining from {len(demo_buffer)} human demonstrations...")
+        print(f"Stored {len(demo_buffer)} demos for continual learning")
+        print(f"   BC weight: {self.demo_bc_weight_initial} → {self.demo_bc_weight_final} over {self.demo_bc_decay_gens} generations")
+        
+        # Convert demos to tensors
+        scans = torch.stack([torch.from_numpy(d['scan']) for d in demo_buffer]).float().to(self.device)
+        states = torch.stack([torch.from_numpy(d['state']) for d in demo_buffer]).float().to(self.device)
+        actions = torch.stack([torch.from_numpy(d['action']) for d in demo_buffer]).float().to(self.device)
+        
+        total_loss = 0.0
+        for epoch in range(epochs):
+            # Shuffle data
+            indices = torch.randperm(len(demo_buffer))
+            epoch_loss = 0.0
+            
+            for i in range(0, len(demo_buffer), batch_size):
+                batch_indices = indices[i:i+batch_size]
+                
+                batch_scans = scans[batch_indices]
+                batch_states = states[batch_indices]
+                batch_actions = actions[batch_indices]
+                
+                # Get actor's predicted action distribution
+                input_td = TensorDict({
+                    "observation_scan": batch_scans,
+                    "observation_state": batch_states
+                }, batch_size=batch_scans.shape[0])
+                
+                self.actor_module(input_td)
+                predicted_loc = input_td["loc"]
+                
+                # MSE loss between predicted and human actions
+                loss = torch.nn.functional.mse_loss(predicted_loc, batch_actions)
+                
+                self.actor_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=1.0)
+                self.actor_optimizer.step()
+                
+                epoch_loss += loss.item()
+            
+            avg_epoch_loss = epoch_loss / (len(demo_buffer) // batch_size)
+            if (epoch + 1) % 2 == 0:
+                print(f"  Epoch {epoch+1}/{epochs}, Loss: {avg_epoch_loss:.4f}")
+            total_loss += avg_epoch_loss
+        
+        print(f"Pretraining complete. Avg loss: {total_loss/epochs:.4f}\n")
 
     def learn(self, reward_avg):
         """
@@ -496,8 +574,14 @@ class PPOAgent:
         current_gen_diagnostics = {key: [] for key in self.diagnostic_keys}
         current_gen_diagnostics["reward_avg"] = [reward_avg]
         
+        # Determine number of epochs based on whether we have demonstrations
+        # Fewer epochs with demos to prevent PPO from overwhelming BC regularization
+        num_epochs = self.epochs_with_demos if (self.demo_buffer is not None and len(self.demo_buffer) > 0) else self.epochs
+        if self.demo_buffer is not None and len(self.demo_buffer) > 0:
+            print(f"Training with BC regularization: {num_epochs} epochs (reduced from {self.epochs})")
+        
         # Train for several epochs on this same data
-        for _ in range(self.epochs): # PPO repeats training on the same data            
+        for _ in range(num_epochs): # PPO repeats training on the same data            
             # Shuffle data indices for this epoch
             indices = torch.randperm(total_samples)
             
@@ -515,11 +599,11 @@ class PPOAgent:
                 # Get the loss from torchrl's PPO module
                 loss_td = self.loss_module(minibatch_data) # <--- Run on the minibatch
 
-                # Sum the actor and critic losses
+                # # Sum the actor and critic losses
                 actor_loss = loss_td["loss_objective"] + loss_td["loss_entropy"]
                 critic_loss = loss_td["loss_critic"]
                 
-                # -- Backpropagation --
+                # -- Backpropagation for PPO --
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=2.0)
@@ -529,12 +613,82 @@ class PPOAgent:
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic_module.parameters(), max_norm=2.0)
                 self.critic_optimizer.step()
+                
+                # --- Behavior Cloning Regularization (Prevent Catastrophic Forgetting) ---
+                # Separate gradient step to avoid mixing loss scales
+                if self.demo_buffer is not None and len(self.demo_buffer) > 0:
+                    # Calculate current BC weight with decay schedule
+                    if self.demo_pretrain_generation is not None:
+                        gens_since_pretrain = self.generation_counter - self.demo_pretrain_generation
+                        if gens_since_pretrain < self.demo_bc_decay_gens:
+                            # Linear decay from initial to final weight
+                            decay_progress = gens_since_pretrain / self.demo_bc_decay_gens
+                            current_bc_weight = self.demo_bc_weight_initial - decay_progress * (self.demo_bc_weight_initial - self.demo_bc_weight_final)
+                        else:
+                            current_bc_weight = self.demo_bc_weight_final
+                    else:
+                        current_bc_weight = self.demo_bc_weight_initial
+                    
+                    # Sample a minibatch from demonstration buffer (50% of minibatch)
+                    demo_batch_size = min(len(self.demo_buffer), minibatch_size // 2)
+                    demo_indices = torch.randint(0, len(self.demo_buffer), (demo_batch_size,)).tolist()
+                    
+                    demo_scans = torch.stack([torch.from_numpy(self.demo_buffer[idx]["scan"]).float() for idx in demo_indices]).to(self.device)
+                    demo_states = torch.stack([torch.from_numpy(self.demo_buffer[idx]["state"]).float() for idx in demo_indices]).to(self.device)
+                    demo_actions = torch.stack([torch.from_numpy(self.demo_buffer[idx]["action"]).float() for idx in demo_indices]).to(self.device)
+                    
+                    # Get actor's prediction for demonstration observations
+                    demo_input_td = TensorDict({
+                        "observation_scan": demo_scans,
+                        "observation_state": demo_states
+                    }, batch_size=demo_scans.shape[0])
+                    
+                    self.actor_module(demo_input_td)
+                    predicted_actions = demo_input_td["loc"]
+                    
+                    # MSE loss between predicted and human actions
+                    bc_loss = torch.nn.functional.mse_loss(predicted_actions, demo_actions)
+                    
+                    # Apply BC loss as separate gradient step
+                    self.actor_optimizer.zero_grad()
+                    bc_loss_weighted = current_bc_weight * bc_loss
+                    bc_loss_weighted.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=2.0)
+                    self.actor_optimizer.step()
+                    
+                    # Log BC activity occasionally
+                    if start == 0:  # First minibatch of each epoch
+                        print(f"  BC: weight={current_bc_weight:.3f}, loss={bc_loss.item():.4f}, weighted={bc_loss_weighted.item():.4f}")
 
                 for key in self.diagnostic_keys:
                     if key in loss_td.keys():
                             value = loss_td[key].detach().cpu().item()
                             current_gen_diagnostics[key].append(value)
         
+        # Adaptive entropy coefficient - update ONCE per generation based on average entropy
+        if current_gen_diagnostics.get("entropy"):
+            avg_entropy = np.mean(current_gen_diagnostics["entropy"])
+            # Target entropy for continuous action spaces (positive values)
+            target_entropy = 0.8  # Healthy exploration level for 2D continuous actions
+
+            # Adjust entropy coefficient based on average entropy across generation
+            if avg_entropy < target_entropy:
+                # Aggressive increase when entropy is too low
+                if avg_entropy < 0.5:  # Critically low
+                    adjustment = 1.15  # 15% increase
+                elif avg_entropy < 0.7:  # Low
+                    adjustment = 1.10  # 10% increase
+                else:  # Slightly low
+                    adjustment = 1.05  # 5% increase
+                self.loss_module.entropy_coeff.data *= adjustment
+            elif avg_entropy > target_entropy + 0.3:  # Too high (>1.1)
+                self.loss_module.entropy_coeff.data *= 0.95  # Slow decrease when too high
+            # Otherwise maintain current coefficient
+
+            # Clamp to reasonable range
+            self.loss_module.entropy_coeff.data.clamp_(0.1, 0.8)  # Increased minimum from 0.05 to 0.1
+            print(f"Entropy coeff adjusted to {self.loss_module.entropy_coeff.data.item():.4f} (avg entropy: {avg_entropy:.3f})")
+                
         self.generation_counter += 1
         for key in self.diagnostic_keys:
             values = current_gen_diagnostics.get(key)

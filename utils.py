@@ -12,7 +12,12 @@ def get_map_dir(map_name):
     map_dir = os.path.join('maps', map_name)
     return map_dir
 
-def generate_start_poses(map_name, num_agents, theta_jitter=0.05, verbose=False):
+def _get_wrapped_distance(s1, s2, track_length):
+    """Calculates the shortest distance between two points on a circular track."""
+    diff = abs(s1 - s2)
+    return min(diff, track_length - diff)
+
+def generate_start_poses(map_name, num_agents, theta_jitter=0.05, verbose=False, agent_poses=None):
     """
     Generates safe starting poses evenly distributed along the map's raceline,
     using the format from the f1tenth_racetracks repository.
@@ -56,22 +61,51 @@ def generate_start_poses(map_name, num_agents, theta_jitter=0.05, verbose=False)
         interp_x = interp1d(cumulative_distances, waypoints[:, 1], kind='linear') # <-- x index 1
         interp_y = interp1d(cumulative_distances, waypoints[:, 2], kind='linear') # <-- y index 2
         
-        # Find closest waypoint index *before* target distance for theta
-        interp_theta_indices = np.searchsorted(cumulative_distances, target_distances, side='right') - 1
+        if agent_poses is not None:
+            # We only care about the (x, y) coordinates for distance checks
+            avoid_list_xy = list(agent_poses[:, :2])
+        else:
+            avoid_list_xy = []
         
-        start_poses = []
-        for i, target_s in enumerate(target_distances):
-            theta_offset = random.uniform(-theta_jitter, theta_jitter)
-            x = interp_x(target_s)
-            y = interp_y(target_s)
-            closest_wp_index = interp_theta_indices[i]
-             # Ensure index is valid
-            closest_wp_index = max(0, min(closest_wp_index, len(waypoints) - 1))
-            theta = waypoints[closest_wp_index, 3] # <-- theta (psi_rad) index 3
-            start_poses.append([x, y, theta + theta_offset])
+        generated_poses = [] # This will store the final [x, y, theta] poses
+        
+        for _ in range(num_agents): # We need to generate this many new poses
+            
+            # Keep re-rolling until we find a safe spot
+            is_safe = False
+            while not is_safe:
+                # 2. Generate one new random pose (x, y, theta)
+                target_s = random.uniform(0, total_raceline_length)
+                
+                # Interpolate x, y, theta from this target_s
+                x = interp_x(target_s)
+                y = interp_y(target_s)
+                
+                interp_theta_index = np.searchsorted(cumulative_distances, target_s, side='right') - 1
+                interp_theta_index = max(0, min(interp_theta_index, len(waypoints) - 1))
+                theta = waypoints[interp_theta_index, 3] + random.uniform(-theta_jitter, theta_jitter)
+                
+                new_pose_xy = np.array([x, y])
+                
+                # 3. Assume it's safe and check against the *entire* avoid list
+                #    (This includes active agents AND newly spawned agents)
+                is_safe = True
+                for existing_xy in avoid_list_xy:
+                    dist = np.linalg.norm(new_pose_xy - existing_xy)
+                    
+                    if dist < 2.0:  # Minimum safe distance
+                        # Collision found, re-roll
+                        is_safe = False
+                        break
+            
+            # 4. We found a safe spot!
+            # Add the full pose to our list of generated poses
+            generated_poses.append([x, y, theta])
+            # Add just the (x, y) to the avoid list for future checks
+            avoid_list_xy.append(new_pose_xy)
 
-        if verbose: print(f"Generated {num_agents} start poses spaced along the raceline.")
-        return np.array(start_poses)
+        if verbose: print(f"Generated {num_agents} safe start poses.")
+        return np.array(generated_poses)
 
     except Exception as e:
         print(f"Warning: Could not generate poses from raceline. Using default fallback. Error: {e}")
@@ -101,3 +135,40 @@ def check_nan(obs):
                 else:
                     obs[k] = np.nan_to_num(v)
     return obs
+
+def buffer_to_pkl(buffer, filename):
+    """
+    Saves the demonstration buffer to a pickle file.
+    
+    Args:
+        buffer (list): List of demonstration tuples.
+        filename (str): Path to the output pickle file.
+    """
+    import pickle
+    
+    if not os.path.exists("demonstrations"):
+        os.makedirs("demonstrations")
+
+    with open("demonstrations/" + filename, mode='wb') as file:
+        pickle.dump(buffer, file)
+            
+def load_buffer_from_pkl(filename):
+    """
+    Loads the demonstration buffer from a pickle file.
+    
+    Args:
+        filename (str): Path to the input pickle file.
+    """
+    import pickle
+    
+    filename = "demonstrations/" + filename
+
+    if not os.path.exists(filename):
+        print("No demonstration buffer found at", filename)
+        return []
+    
+    print("Loading demonstration buffer from", filename)
+    with open(filename, mode='rb') as file:
+        buffer = pickle.load(file)
+    
+    return buffer
